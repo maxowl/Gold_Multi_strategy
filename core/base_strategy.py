@@ -10,6 +10,22 @@ from typing import Dict, Optional
 
 from core.atr_cache import ATRCache
 
+# =========================================================================
+# TIMEZONE IMPORTS WITH FALLBACK
+# =========================================================================
+try:
+    from zoneinfo import ZoneInfo
+    _TZ_AVAILABLE = True
+    _USE_ZONEINFO = True
+except ImportError:
+    try:
+        import pytz
+        _TZ_AVAILABLE = True
+        _USE_ZONEINFO = False
+    except ImportError:
+        _TZ_AVAILABLE = False
+        _USE_ZONEINFO = False
+
 
 class BaseStrategy(ABC):
     """
@@ -25,6 +41,21 @@ class BaseStrategy(ABC):
         self.strategy_category = strategy_category
         self.min_risk_reward = min_risk_reward
         self.logger = logging.getLogger(self.__class__.__name__)
+        
+        # =========================================================================
+        # TIMEZONE INITIALIZATION (Fixes AttributeError)
+        # =========================================================================
+        self.ny_tz = None
+        self.utc_tz = None
+        
+        if _TZ_AVAILABLE:
+            if _USE_ZONEINFO:
+                self.ny_tz = ZoneInfo('America/New_York')
+                self.utc_tz = ZoneInfo('UTC')
+            else:
+                import pytz
+                self.ny_tz = pytz.timezone('America/New_York')
+                self.utc_tz = pytz.UTC
     
     @abstractmethod
     def evaluate(self, df_primary: pd.DataFrame, df_htf: pd.DataFrame = None) -> dict:
@@ -49,76 +80,102 @@ class BaseStrategy(ABC):
         is_buy: bool, atr_multiplier: float = 1.5, max_risk_atr: float = 3.0
     ) -> Dict:
         """
-        Calculate Stop Loss with Micro-Account Mode support and session awareness.
+        Calculate Stop Loss based on session and structural levels.
+        Includes Micro-Account Mode override with fixed SL distance.
         """
         from config import config
         
-        # Micro-Account Mode: Use fixed SL distance
-        if getattr(config, 'micro_account_mode', False):
-            sl_distance = config.micro_sl_distance_usd
+        # [MICRO-ACCOUNT OVERRIDE] Use fixed SL distance scaled for current price
+        # if getattr(config, 'micro_account_mode', False):
+        #     sl_distance = config.micro_sl_distance_usd
             
+        #     if is_buy:
+        #         sl_price = entry_price - sl_distance
+        #     else:
+        #         sl_price = entry_price + sl_distance
+            
+        #     return {
+        #         'sl_price': round(sl_price, 2),
+        #         'valid': True,
+        #         'reason': f'Micro-Account SL ({sl_distance} USD)',
+        #         'session': 'MICRO_ACCOUNT',
+        #         'risk': round(sl_distance, 2)
+        #     }
+        
+        # =========================================================================
+        # Normal Mode: ATR-based calculation
+        # =========================================================================
+        atr_series = ATRCache.get_atr(df, 14)
+        if atr_series.isna().all() or len(atr_series) == 0:
+            return {'sl_price': 0, 'valid': False, 'reason': 'ATR calculation failed', 'session': 'UNKNOWN'}
+        
+        atr = float(atr_series.iloc[-1])
+        if pd.isna(atr) or atr == 0:
+            return {'sl_price': 0, 'valid': False, 'reason': 'ATR is zero or NaN', 'session': 'UNKNOWN'}
+        
+        # Determine current session
+        session = 'UNKNOWN'
+        if 'time' in df.columns and self.ny_tz is not None and self.utc_tz is not None:
+            try:
+                last_time = df['time'].iloc[-1]
+                if not isinstance(last_time, pd.Timestamp):
+                    last_time = pd.to_datetime(last_time, unit='s', utc=True)
+                
+                # Safely handle tz-naive vs tz-aware
+                if last_time.tz is None:
+                    last_time = last_time.tz_localize(self.utc_tz)
+                
+                ny_time = last_time.tz_convert(self.ny_tz)
+                hour = ny_time.hour
+                
+                if 2 <= hour < 5:
+                    session = 'LONDON_OPEN'
+                elif 9 <= hour < 11:
+                    session = 'NY_OPEN'
+                elif 5 <= hour < 9:
+                    session = 'LONDON'
+                elif 11 <= hour < 17:
+                    session = 'NY_MIDDAY'
+                elif (19 <= hour <= 23) or (0 <= hour <= 1):
+                    session = 'ASIAN'
+                elif 17 <= hour < 19:
+                    session = 'US_CLOSE'
+                else:
+                    session = 'OTHER'
+            except Exception as e:
+                self.logger.debug(f"[SESSION] Timezone conversion error: {e}")
+                session = 'OTHER'
+        
+        # Calculate SL based on structural level
+        if is_buy:
+            sl_price = structural_level - (atr * atr_multiplier)
+        else:
+            sl_price = structural_level + (atr * atr_multiplier)
+        
+        # Validate risk distance
+        risk = abs(entry_price - sl_price)
+        max_risk = atr * max_risk_atr
+        
+        if risk > max_risk:
             if is_buy:
-                sl_price = entry_price - sl_distance
+                sl_price = entry_price - max_risk
             else:
-                sl_price = entry_price + sl_distance
-            
-            session = self._get_current_session(df)
+                sl_price = entry_price + max_risk
             
             return {
                 'sl_price': round(sl_price, 2),
                 'valid': True,
-                'reason': f'Micro-Account SL ({sl_distance} USD)',
+                'reason': f'SL adjusted to max risk ({max_risk_atr} ATR)',
                 'session': session,
-                'risk': round(sl_distance, 2)
+                'risk': round(max_risk, 2)
             }
-        
-        # Normal Mode: ATR-based calculation
-        atr_series = ATRCache.get_atr(df, 14)
-        if atr_series.isna().all() or len(atr_series) == 0:
-            return {
-                'sl_price': 0, 
-                'valid': False, 
-                'reason': 'ATR calculation failed', 
-                'session': 'UNKNOWN',
-                'risk': 0.0
-            }
-        
-        atr = float(atr_series.iloc[-1])
-        if pd.isna(atr) or atr == 0:
-            return {
-                'sl_price': 0, 
-                'valid': False, 
-                'reason': 'ATR is zero or NaN', 
-                'session': 'UNKNOWN',
-                'risk': 0.0
-            }
-        
-        session = self._get_current_session(df)
-        session_mult = self._get_session_atr_multiplier(session)
-        
-        sl_distance = atr * atr_multiplier * session_mult
-        
-        max_risk = atr * max_risk_atr
-        if sl_distance > max_risk:
-            sl_distance = max_risk
-        
-        if is_buy:
-            sl_price = structural_level - (0.3 * atr)
-            actual_distance = abs(entry_price - sl_price)
-            if actual_distance < sl_distance:
-                sl_price = entry_price - sl_distance
-        else:
-            sl_price = structural_level + (0.3 * atr)
-            actual_distance = abs(entry_price - sl_price)
-            if actual_distance < sl_distance:
-                sl_price = entry_price + sl_distance
         
         return {
             'sl_price': round(sl_price, 2),
             'valid': True,
-            'reason': f'Session-Based SL ({session}, ATR*{atr_multiplier:.1f})',
+            'reason': 'OK',
             'session': session,
-            'risk': round(abs(entry_price - sl_price), 2)
+            'risk': round(risk, 2)
         }
     
     def calculate_fib_tp(
@@ -264,17 +321,18 @@ class BaseStrategy(ABC):
         if df is None or df.empty or 'time' not in df.columns:
             return 'OTHER'
         
+        if self.ny_tz is None or self.utc_tz is None:
+            return 'OTHER'
+        
         try:
             last_time = df['time'].iloc[-1]
             if not isinstance(last_time, pd.Timestamp):
-                last_time = pd.to_datetime(last_time)
+                last_time = pd.to_datetime(last_time, unit='s', utc=True)
             
-            import pytz
-            if last_time.tzinfo is None:
-                last_time = last_time.tz_localize('UTC')
+            if last_time.tz is None:
+                last_time = last_time.tz_localize(self.utc_tz)
             
-            ny_tz = pytz.timezone('America/New_York')
-            ny_time = last_time.astimezone(ny_tz)
+            ny_time = last_time.tz_convert(self.ny_tz)
             hour = ny_time.hour
             
             if 2 <= hour < 5:

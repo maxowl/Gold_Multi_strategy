@@ -1,107 +1,232 @@
 """
-Enhanced Strategy Allocator.
-Assigns weights to strategies based on 18-regime system and Kelly multiplier.
+Enhanced Strategy Allocator - 18-Regime Weight Distribution System.
+Maps 25 strategies to 18 market regimes with institutional-grade precision.
+Integrates Kelly Criterion multipliers for optimal capital allocation.
+
+Includes backward compatibility wrapper for legacy code.
 """
 import logging
-from typing import Dict
+from typing import Dict, List
 
 
 class EnhancedStrategyAllocator:
     """
-    Allocates position weights to strategies based on current market regime.
+    18-Regime Strategy Weight Allocator.
+    
+    Allocates weights to 25 strategies based on current regime combination:
+    - Trend Direction (BULL/BEAR/SIDEWAY)
+    - Volatility Level (LOW/NORMAL/HIGH)
+    - Fractal Behavior (TRENDING/MEAN_REVERTING)
     """
+    
+    # Strategy Category Mapping
+    STRATEGY_CATEGORIES = {
+        # TREND-Following Strategies (9)
+        'S3_EMD_HHT': 'TREND',
+        'S10_EhlersMESA': 'TREND',
+        'S12_PCA_Cycle': 'TREND',
+        'S13_TMF_EOM': 'TREND',
+        'S14_Propulsion': 'TREND',
+        'S17_ChaosSqueeze': 'TREND',
+        'S20_VFIAccumulation': 'TREND',
+        'S24_KalmanMomentum': 'TREND',
+        'S25_HurstWavelet': 'TREND',
+        
+        # MEAN-REVERSION Strategies (6)
+        'S6_QuantumPDF': 'MEAN_REVERSION',
+        'S8_GPR_Vol': 'MEAN_REVERSION',
+        'S15_HFT_StatArb': 'MEAN_REVERSION',
+        'S16_RoofingEMD': 'MEAN_REVERSION',
+        'S18_EhlersVector': 'MEAN_REVERSION',
+        'S22_WyckoffSpring': 'MEAN_REVERSION',
+        
+        # SMC (Smart Money Concepts) Strategies (5)
+        'S1_IOB_Rejection': 'SMC',
+        'S4_CHOCH_IDM': 'SMC',
+        'S5_Breaker_Void': 'SMC',
+        'S7_MacroFVG': 'SMC',
+        'S21_BreakerFVGPOC': 'SMC',
+        
+        # SCALP Strategies (5)
+        'S2_VI_Sweep': 'SCALP',
+        'S9_SessionSweep': 'SCALP',
+        'S11_LiquidityDelta': 'SCALP',
+        'S19_VoidReversal': 'SCALP',
+        'S23_MidnightJudas': 'SCALP',
+    }
+    
+    # 18-Regime Weight Mapping (Institutional Standard)
+    # Format: {regime_name: {category: base_weight_percentage}}
+    REGIME_WEIGHTS = {
+        # BULL TREND REGIMES
+        'QUIET_RALLY': {
+            'TREND': 0.70, 'MEAN_REVERSION': 0.05, 'SMC': 0.15, 'SCALP': 0.10
+        },
+        'ANOMALY_BULL': {
+            'TREND': 0.00, 'MEAN_REVERSION': 0.60, 'SMC': 0.10, 'SCALP': 0.30
+        },
+        'HEALTHY_UPTREND': {
+            'TREND': 0.50, 'MEAN_REVERSION': 0.05, 'SMC': 0.35, 'SCALP': 0.10
+        },
+        'CONSOLIDATING_BULL': {
+            'TREND': 0.10, 'MEAN_REVERSION': 0.45, 'SMC': 0.25, 'SCALP': 0.20
+        },
+        'PARABOLIC_RALLY': {
+            'TREND': 0.20, 'MEAN_REVERSION': 0.10, 'SMC': 0.10, 'SCALP': 0.60
+        },
+        'EXHAUSTED_BULL': {
+            'TREND': 0.00, 'MEAN_REVERSION': 0.35, 'SMC': 0.15, 'SCALP': 0.50
+        },
+        
+        # SIDEWAY REGIMES
+        'PRE_BREAKOUT': {
+            'TREND': 0.15, 'MEAN_REVERSION': 0.15, 'SMC': 0.50, 'SCALP': 0.20
+        },
+        'TIGHT_RANGE': {
+            'TREND': 0.05, 'MEAN_REVERSION': 0.55, 'SMC': 0.15, 'SCALP': 0.25
+        },
+        'FALSE_SIDEWAY': {
+            'TREND': 0.40, 'MEAN_REVERSION': 0.10, 'SMC': 0.25, 'SCALP': 0.25
+        },
+        'CLASSIC_RANGE': {
+            'TREND': 0.05, 'MEAN_REVERSION': 0.50, 'SMC': 0.20, 'SCALP': 0.25
+        },
+        'VOLATILE_CHOP': {
+            'TREND': 0.00, 'MEAN_REVERSION': 0.20, 'SMC': 0.20, 'SCALP': 0.60
+        },
+        'WHIPSAW_MARKET': {
+            'TREND': 0.00, 'MEAN_REVERSION': 0.25, 'SMC': 0.15, 'SCALP': 0.60
+        },
+        
+        # BEAR TREND REGIMES
+        'SLOW_BLEED': {
+            'TREND': 0.70, 'MEAN_REVERSION': 0.05, 'SMC': 0.15, 'SCALP': 0.10
+        },
+        'ANOMALY_BEAR': {
+            'TREND': 0.00, 'MEAN_REVERSION': 0.60, 'SMC': 0.10, 'SCALP': 0.30
+        },
+        'HEALTHY_DOWNTREND': {
+            'TREND': 0.50, 'MEAN_REVERSION': 0.05, 'SMC': 0.35, 'SCALP': 0.10
+        },
+        'CONSOLIDATING_BEAR': {
+            'TREND': 0.10, 'MEAN_REVERSION': 0.45, 'SMC': 0.25, 'SCALP': 0.20
+        },
+        'PANIC_CAPITULATION': {
+            'TREND': 0.15, 'MEAN_REVERSION': 0.10, 'SMC': 0.10, 'SCALP': 0.65
+        },
+        'OVERSOLD_BOUNCE': {
+            'TREND': 0.05, 'MEAN_REVERSION': 0.50, 'SMC': 0.25, 'SCALP': 0.20
+        },
+    }
+    
+    # Regime-specific strategy adjustments (override base weights)
+    # Format: {regime_name: {strategy_name: multiplier}}
+    REGIME_STRATEGY_OVERRIDES = {
+        'QUIET_RALLY': {
+            'S10_EhlersMESA': 1.3, 'S24_KalmanMomentum': 1.3, 'S25_HurstWavelet': 1.3
+        },
+        'ANOMALY_BULL': {
+            'S6_QuantumPDF': 1.2, 'S8_GPR_Vol': 1.2
+        },
+        'HEALTHY_UPTREND': {
+            'S3_EMD_HHT': 1.2, 'S14_Propulsion': 1.2, 'S1_IOB_Rejection': 1.3,
+            'S4_CHOCH_IDM': 1.3, 'S5_Breaker_Void': 1.3
+        },
+        'PARABOLIC_RALLY': {
+            'S2_VI_Sweep': 1.3, 'S9_SessionSweep': 1.3, 'S11_LiquidityDelta': 1.3
+        },
+        'EXHAUSTED_BULL': {
+            'S17_ChaosSqueeze': 1.2, 'S22_WyckoffSpring': 1.2
+        },
+        'PRE_BREAKOUT': {
+            'S17_ChaosSqueeze': 1.4, 'S5_Breaker_Void': 1.3, 'S21_BreakerFVGPOC': 1.3
+        },
+        'TIGHT_RANGE': {
+            'S6_QuantumPDF': 1.3, 'S8_GPR_Vol': 1.3, 'S15_HFT_StatArb': 1.3,
+            'S16_RoofingEMD': 1.3, 'S18_EhlersVector': 1.3
+        },
+        'FALSE_SIDEWAY': {
+            'S14_Propulsion': 1.3, 'S3_EMD_HHT': 1.2, 'S12_PCA_Cycle': 1.2
+        },
+        'CLASSIC_RANGE': {
+            'S6_QuantumPDF': 1.2, 'S9_SessionSweep': 1.2, 'S19_VoidReversal': 1.2
+        },
+        'VOLATILE_CHOP': {
+            'S4_CHOCH_IDM': 1.3, 'S19_VoidReversal': 1.3
+        },
+        'WHIPSAW_MARKET': {
+            'S9_SessionSweep': 1.3, 'S22_WyckoffSpring': 1.3, 'S23_MidnightJudas': 1.3
+        },
+        'SLOW_BLEED': {
+            'S10_EhlersMESA': 1.3, 'S24_KalmanMomentum': 1.3, 'S25_HurstWavelet': 1.3
+        },
+        'ANOMALY_BEAR': {
+            'S6_QuantumPDF': 1.2, 'S8_GPR_Vol': 1.2
+        },
+        'HEALTHY_DOWNTREND': {
+            'S3_EMD_HHT': 1.2, 'S14_Propulsion': 1.2, 'S1_IOB_Rejection': 1.3,
+            'S4_CHOCH_IDM': 1.3, 'S5_Breaker_Void': 1.3
+        },
+        'PANIC_CAPITULATION': {
+            'S2_VI_Sweep': 1.3, 'S11_LiquidityDelta': 1.3, 'S19_VoidReversal': 1.3
+        },
+        'OVERSOLD_BOUNCE': {
+            'S22_WyckoffSpring': 1.4, 'S9_SessionSweep': 1.3, 'S17_ChaosSqueeze': 1.2
+        },
+    }
+    
+    # Blocked strategies per regime (force weight to 0)
+    BLOCKED_STRATEGIES = {
+        'ANOMALY_BULL': ['S3_EMD_HHT', 'S10_EhlersMESA', 'S14_Propulsion', 'S24_KalmanMomentum', 'S25_HurstWavelet'],
+        'EXHAUSTED_BULL': ['S3_EMD_HHT', 'S10_EhlersMESA', 'S14_Propulsion', 'S24_KalmanMomentum', 'S25_HurstWavelet'],
+        'VOLATILE_CHOP': ['S3_EMD_HHT', 'S10_EhlersMESA', 'S14_Propulsion', 'S24_KalmanMomentum', 'S25_HurstWavelet'],
+        'WHIPSAW_MARKET': ['S3_EMD_HHT', 'S10_EhlersMESA', 'S14_Propulsion', 'S24_KalmanMomentum', 'S25_HurstWavelet'],
+        'ANOMALY_BEAR': ['S3_EMD_HHT', 'S10_EhlersMESA', 'S14_Propulsion', 'S24_KalmanMomentum', 'S25_HurstWavelet'],
+        'PANIC_CAPITULATION': ['S3_EMD_HHT', 'S10_EhlersMESA', 'S14_Propulsion', 'S24_KalmanMomentum', 'S25_HurstWavelet'],
+    }
     
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
-    
-    # 18-Regime Weight Configuration
-    REGIME_WEIGHTS = {
-        # Healthy trends
-        'HEALTHY_UPTREND': {'TREND': 0.6, 'SMC': 0.2, 'MEAN_REVERSION': 0.1, 'SCALP': 0.1},
-        'HEALTHY_DOWNTREND': {'TREND': 0.6, 'SMC': 0.2, 'MEAN_REVERSION': 0.1, 'SCALP': 0.1},
-        
-        # Quiet trends
-        'QUIET_RALLY': {'TREND': 0.5, 'SMC': 0.2, 'MEAN_REVERSION': 0.2, 'SCALP': 0.1},
-        'SLOW_BLEED': {'TREND': 0.5, 'SMC': 0.2, 'MEAN_REVERSION': 0.2, 'SCALP': 0.1},
-        
-        # Ranges
-        'TIGHT_RANGE': {'MEAN_REVERSION': 0.5, 'SCALP': 0.3, 'SMC': 0.15, 'TREND': 0.05},
-        'CLASSIC_RANGE': {'MEAN_REVERSION': 0.4, 'SCALP': 0.3, 'SMC': 0.2, 'TREND': 0.1},
-        'WIDE_RANGE': {'MEAN_REVERSION': 0.3, 'SCALP': 0.4, 'SMC': 0.2, 'TREND': 0.1},
-        
-        # Reversals
-        'BOUNCE_REVERSAL': {'SMC': 0.5, 'MEAN_REVERSION': 0.3, 'TREND': 0.1, 'SCALP': 0.1},
-        'EXHAUSTED_REVERSAL': {'MEAN_REVERSION': 0.5, 'SMC': 0.3, 'TREND': 0.1, 'SCALP': 0.1},
-        
-        # Volatile
-        'CHOPPY_HIGH_VOL': {'SCALP': 0.5, 'MEAN_REVERSION': 0.3, 'SMC': 0.1, 'TREND': 0.1},
-        'WHIPSAW': {'SCALP': 0.4, 'MEAN_REVERSION': 0.4, 'SMC': 0.1, 'TREND': 0.1},
-        
-        # Extreme
-        'PARABOLIC_UP': {'MEAN_REVERSION': 0.6, 'SCALP': 0.3, 'SMC': 0.1, 'TREND': 0.0},
-        'PARABOLIC_DOWN': {'MEAN_REVERSION': 0.6, 'SCALP': 0.3, 'SMC': 0.1, 'TREND': 0.0},
-        'PANIC_SELL': {'MEAN_REVERSION': 0.5, 'SCALP': 0.4, 'SMC': 0.1, 'TREND': 0.0},
-        'FOMO_BUY': {'MEAN_REVERSION': 0.5, 'SCALP': 0.4, 'SMC': 0.1, 'TREND': 0.0},
-        
-        # Anomalies
-        'LIQUIDITY_ANOMALY': {'SCALP': 0.6, 'SMC': 0.3, 'MEAN_REVERSION': 0.1, 'TREND': 0.0},
-        'VOLUME_ANOMALY': {'SCALP': 0.5, 'SMC': 0.3, 'MEAN_REVERSION': 0.2, 'TREND': 0.0},
-        
-        # Unknown
-        'UNKNOWN': {'TREND': 0.25, 'SMC': 0.25, 'MEAN_REVERSION': 0.25, 'SCALP': 0.25}
-    }
-    
-    # Strategy to Category mapping
-    STRATEGY_CATEGORIES = {
-        'S1_IOB_Rejection': 'SMC', 'S2_VI_Sweep': 'SCALP', 'S3_EMD_HHT': 'TREND',
-        'S4_CHOCH_IDM': 'SMC', 'S5_Breaker_Void': 'SMC', 'S6_QuantumPDF': 'MEAN_REVERSION',
-        'S7_MacroFVG': 'SMC', 'S8_GPR_Vol': 'MEAN_REVERSION', 'S9_SessionSweep': 'SCALP',
-        'S10_EhlersMESA': 'TREND', 'S11_LiquidityDelta': 'SCALP', 'S12_PCA_Cycle': 'TREND',
-        'S13_TMF_EOM': 'TREND', 'S14_Propulsion': 'TREND', 'S15_HFT_StatArb': 'MEAN_REVERSION',
-        'S16_RoofingEMD': 'MEAN_REVERSION', 'S17_ChaosSqueeze': 'TREND', 'S18_EhlersVector': 'MEAN_REVERSION',
-        'S19_VoidReversal': 'SCALP', 'S20_VFIAccumulation': 'TREND', 'S21_BreakerFVGPOC': 'SMC',
-        'S22_WyckoffSpring': 'MEAN_REVERSION', 'S23_MidnightJudas': 'SCALP', 'S24_KalmanMomentum': 'TREND',
-        'S25_HurstWavelet': 'TREND'
-    }
-    
+
     def allocate_weights_18_regime(self, regime_name: str, kelly_multiplier: float,
                                    strategy_signals: Dict[str, dict]) -> Dict[str, float]:
         """
-        Allocate weights to strategies based on 18-regime system.
-        [FIX] Clamps weights before applying Kelly multiplier to prevent overflow.
+        Allocate weights to strategies based on 18-regime classification.
+        
+        Args:
+            regime_name: One of 18 regime names (e.g., 'HEALTHY_UPTREND')
+            kelly_multiplier: Kelly Criterion multiplier from RegimeRouter
+            strategy_signals: Dict of strategy_name -> signal_dict
+        
+        Returns:
+            Dict mapping strategy_name to weight (0.0-1.0)
         """
         weights = {}
-        regime_weights = self.REGIME_WEIGHTS.get(regime_name, self.REGIME_WEIGHTS['UNKNOWN'])
+        
+        # Get base category weights for this regime
+        regime_weights = self.REGIME_WEIGHTS.get(regime_name, self.REGIME_WEIGHTS['CLASSIC_RANGE'])
+        
+        # Get strategy overrides for this regime
+        overrides = self.REGIME_STRATEGY_OVERRIDES.get(regime_name, {})
+        
+        # Get blocked strategies for this regime
+        blocked = self.BLOCKED_STRATEGIES.get(regime_name, [])
         
         # Group strategies by category
-        categories = {'TREND': [], 'SMC': [], 'MEAN_REVERSION': [], 'SCALP': []}
-        for strat_name, cat in self.STRATEGY_CATEGORIES.items():
-            if cat in categories:
-                categories[cat].append(strat_name)
+        categories = {}
+        for strategy_name, category in self.STRATEGY_CATEGORIES.items():
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(strategy_name)
         
-        # Block strategies in incompatible regimes
-        blocked = set()
-        if 'PARABOLIC' in regime_name or 'PANIC' in regime_name or 'FOMO' in regime_name:
-            # Block trend following in extreme regimes
-            blocked.update(categories['TREND'])
-        if 'WHIPSAW' in regime_name or 'CHOPPY' in regime_name:
-            # Block trend following in choppy markets
-            blocked.update(categories['TREND'])
-        
-        # Override multipliers for specific strategies
-        overrides = {
-            'S2_VI_Sweep': 1.2,
-            'S9_SessionSweep': 1.2,
-            'S23_MidnightJudas': 1.1
-        }
-        
-        # Calculate weights per category
+        # Distribute weights within each category
         for category, strategies in categories.items():
             category_weight = regime_weights.get(category, 0.1)
             
             if not strategies:
                 continue
             
+            # Base weight per strategy in this category
             base_weight = category_weight / len(strategies)
             
             for strategy_name in strategies:
@@ -117,34 +242,132 @@ class EnhancedStrategyAllocator:
                 # Apply signal quality adjustment
                 if strategy_name in strategy_signals:
                     signal_conf = strategy_signals[strategy_name].get('meta', {}).get('confidence', 0.5)
-                    signal_mult = 0.5 + signal_conf
+                    adjusted_weight *= (0.5 + signal_conf)
                 else:
-                    signal_mult = 0.5
-                
-                adjusted_weight *= signal_mult
-                
-                # [FIX] Clamp before applying Kelly multiplier to prevent overflow
-                adjusted_weight = max(0.0, min(1.0, adjusted_weight))
+                    adjusted_weight *= 0.5  # Reduce weight for strategies without signals
                 
                 # Apply Kelly multiplier
                 final_weight = adjusted_weight * kelly_multiplier
                 
-                # Final clamp to [0.0, 1.0]
+                # Clamp to [0.0, 1.0]
                 final_weight = max(0.0, min(1.0, final_weight))
                 
                 weights[strategy_name] = round(final_weight, 4)
         
         return weights
     
-    def get_blocked_strategies(self, regime_name: str) -> set:
-        """Return set of strategy names blocked in the given regime."""
-        blocked = set()
-        if 'PARABOLIC' in regime_name or 'PANIC' in regime_name or 'FOMO' in regime_name:
-            for strat, cat in self.STRATEGY_CATEGORIES.items():
-                if cat == 'TREND':
-                    blocked.add(strat)
-        if 'WHIPSAW' in regime_name or 'CHOPPY' in regime_name:
-            for strat, cat in self.STRATEGY_CATEGORIES.items():
-                if cat == 'TREND':
-                    blocked.add(strat)
-        return blocked
+    def get_recommended_strategies(self, weights: Dict[str, float],
+                                   min_weight: float = 0.05) -> List[str]:
+        """Get list of recommended strategies based on weights."""
+        recommended = [name for name, weight in weights.items() if weight >= min_weight]
+        recommended.sort(key=lambda x: weights.get(x, 0.0), reverse=True)
+        return recommended
+    
+    def get_blocked_strategies(self, regime_name: str) -> List[str]:
+        """Get list of blocked strategies for a regime."""
+        return self.BLOCKED_STRATEGIES.get(regime_name, [])
+    
+    def get_regime_analysis(self, regime_name: str) -> Dict:
+        """Get detailed analysis of a regime's strategy allocation."""
+        regime_weights = self.REGIME_WEIGHTS.get(regime_name, {})
+        overrides = self.REGIME_STRATEGY_OVERRIDES.get(regime_name, {})
+        blocked = self.BLOCKED_STRATEGIES.get(regime_name, [])
+        
+        # Count strategies per category
+        category_counts = {}
+        for strategy_name, category in self.STRATEGY_CATEGORIES.items():
+            category_counts[category] = category_counts.get(category, 0) + 1
+        
+        # Calculate expected active strategies
+        active_count = 0
+        for strategy_name in self.STRATEGY_CATEGORIES.keys():
+            if strategy_name not in blocked:
+                active_count += 1
+        
+        return {
+            'regime': regime_name,
+            'category_weights': regime_weights,
+            'strategy_overrides': overrides,
+            'blocked_strategies': blocked,
+            'category_counts': category_counts,
+            'expected_active_strategies': active_count,
+            'total_strategies': len(self.STRATEGY_CATEGORIES)
+        }
+    
+    def compare_regimes(self, regime1: str, regime2: str) -> Dict:
+        """Compare strategy allocation between two regimes."""
+        weights1 = self.allocate_weights_18_regime(regime1, 1.0, {})
+        weights2 = self.allocate_weights_18_regime(regime2, 1.0, {})
+        
+        # Find strategies that differ significantly
+        differences = {}
+        for strategy_name in self.STRATEGY_CATEGORIES.keys():
+            w1 = weights1.get(strategy_name, 0.0)
+            w2 = weights2.get(strategy_name, 0.0)
+            diff = w2 - w1
+            
+            if abs(diff) > 0.1:  # Significant difference
+                differences[strategy_name] = {
+                    'regime1_weight': w1,
+                    'regime2_weight': w2,
+                    'change': diff,
+                    'direction': 'INCREASE' if diff > 0 else 'DECREASE'
+                }
+        
+        return {
+            'regime1': regime1,
+            'regime2': regime2,
+            'significant_differences': differences,
+            'num_changed_strategies': len(differences)
+        }
+
+
+# =========================================================================
+# BACKWARD COMPATIBILITY WRAPPER
+# =========================================================================
+
+class StrategyAllocator(EnhancedStrategyAllocator):
+    """
+    Backward-compatible wrapper for legacy code.
+    Inherits all functionality from EnhancedStrategyAllocator
+    and adds legacy method for old 3-regime system.
+    """
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def allocate_weights(self, regime_id: int, confidence: float,
+                         strategy_signals: Dict[str, dict]) -> Dict[str, float]:
+        """
+        Legacy method for backward compatibility.
+        Maps old 3-regime system to new 18-regime system.
+        
+        Args:
+            regime_id: Old regime ID (0=BULL, 1=BEAR, 2=SIDEWAY)
+            confidence: Confidence score (0.0-1.0)
+            strategy_signals: Dict of strategy signals
+        
+        Returns:
+            Dict mapping strategy_name to weight
+        """
+        # Map old 3-regime system to new 18-regime
+        legacy_mapping = {
+            0: 'HEALTHY_UPTREND',      # BULL_TREND
+            1: 'HEALTHY_DOWNTREND',    # BEAR_TREND
+            2: 'CLASSIC_RANGE'         # SIDEWAY
+        }
+        
+        regime_name = legacy_mapping.get(regime_id, 'CLASSIC_RANGE')
+        kelly_mult = confidence * 2.0  # Scale confidence to Kelly multiplier
+        
+        return self.allocate_weights_18_regime(regime_name, kelly_mult, strategy_signals)
+    
+    def get_weights_for_regime(self, regime_name: str, 
+                               strategy_signals: Dict[str, dict] = None) -> Dict[str, float]:
+        """
+        Convenience method for getting weights with default Kelly multiplier.
+        """
+        if strategy_signals is None:
+            strategy_signals = {}
+        
+        return self.allocate_weights_18_regime(regime_name, 1.0, strategy_signals)
