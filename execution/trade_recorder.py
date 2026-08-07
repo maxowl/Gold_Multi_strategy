@@ -1,7 +1,17 @@
 """
-Trade Recorder.
-Thread-safe database writer for trade history.
-Separates database I/O from the main execution thread to prevent latency spikes.
+Trade Recorder - Thread-Safe Database Writer.
+
+Separates database I/O from the main execution thread to prevent
+latency spikes. Uses a queue and background worker thread.
+
+Features:
+  - Thread-safe trade recording
+  - Asynchronous database writes
+  - Batch processing
+  - Error handling
+
+Used by:
+  - OrderManager (trade recording)
 """
 import sqlite3
 import json
@@ -10,20 +20,47 @@ import threading
 from typing import Dict, Any
 from queue import Queue, Empty
 
+
 class TradeRecorder:
-    def __init__(self, db_path: str):
+    """
+    Trade Recorder with thread-safe database writes.
+    
+    Features:
+      - Thread-safe queue
+      - Background worker thread
+      - Asynchronous database writes
+      - Graceful shutdown
+    """
+
+    def __init__(self, db_path: str = "bot_state.db"):
+        """
+        Initialize TradeRecorder.
+        
+        Args:
+            db_path: Path to SQLite database
+        """
         self.db_path = db_path
         self.logger = logging.getLogger(self.__class__.__name__)
+
         self._queue = Queue()
         self._lock = threading.Lock()
         self._running = True
-        
+
         # Start background worker thread
         self._worker = threading.Thread(target=self._process_queue, daemon=True)
         self._worker.start()
 
+        # Statistics
+        self._records_written = 0
+        self._errors = 0
+
     def enqueue_trade(self, trade_data: Dict[str, Any]):
-        """Add a trade record to the queue for asynchronous writing."""
+        """
+        Add a trade record to the queue for asynchronous writing.
+        
+        Args:
+            trade_data: Trade data dict
+        """
         self._queue.put(trade_data)
 
     def _process_queue(self):
@@ -37,23 +74,26 @@ class TradeRecorder:
             except Empty:
                 continue
             except Exception as e:
-                self.logger.error(f"[FAIL] Trade recorder worker error: {e}")
+                self.logger.error(f"[RECORDER] Worker error: {e}")
+                self._errors += 1
 
     def _write_to_db(self, trade_data: Dict[str, Any]):
         """Execute the actual SQLite insert."""
         try:
             # Serialize meta_data if it's a dict
-            meta_str = json.dumps(trade_data.get('meta_data', {})) if isinstance(trade_data.get('meta_data'), dict) else str(trade_data.get('meta_data', '{}'))
-            
+            meta_str = json.dumps(trade_data.get('meta_data', {})) if isinstance(
+                trade_data.get('meta_data'), dict
+            ) else str(trade_data.get('meta_data', '{}'))
+
             with self._lock:
                 with sqlite3.connect(self.db_path, timeout=10) as conn:
                     conn.execute("""
-                        INSERT OR REPLACE INTO trade_history 
-                        (ticket, symbol, strategy, direction, entry_price, exit_price, 
-                         sl_price, tp_price, volume, profit, commission, swap, 
-                         open_time, close_time, entry_reason, exit_reason, 
+                        INSERT OR REPLACE INTO trade_history
+                        (ticket, symbol, strategy, direction, entry_price, exit_price,
+                         sl_price, tp_price, volume, profit, commission, swap,
+                         open_time, close_time, entry_reason, exit_reason,
                          is_pending, order_type, expected_entry, meta_data)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         trade_data.get('ticket'),
                         trade_data.get('symbol'),
@@ -77,11 +117,23 @@ class TradeRecorder:
                         meta_str
                     ))
                     conn.commit()
+
+            self._records_written += 1
+
         except Exception as e:
-            self.logger.error(f"[FAIL] SQLite write error for ticket {trade_data.get('ticket')}: {e}")
+            self.logger.error(f"[RECORDER] Write error for ticket {trade_data.get('ticket')}: {e}")
+            self._errors += 1
 
     def shutdown(self):
         """Gracefully shutdown the worker thread."""
         self._running = False
         if self._worker.is_alive():
             self._worker.join(timeout=3.0)
+
+    def get_statistics(self) -> Dict:
+        """Get trade recorder statistics."""
+        return {
+            'records_written': self._records_written,
+            'errors': self._errors,
+            'queue_size': self._queue.qsize()
+        }

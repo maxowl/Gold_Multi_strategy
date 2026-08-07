@@ -1,803 +1,734 @@
 """
-Institutional Market Regime Router - Complete Version
-Meta-Ensemble Architecture: HMM + LightGBM + Rule-based + Market Structure
+Regime Router - 18-Regime Detection & Routing System.
 
-Detects 18 Market Regimes across 3 Dimensions:
-  - Dimension 1: Trend Direction (BULL | BEAR | SIDEWAY)
-  - Dimension 2: Volatility Level (LOW | NORMAL | HIGH)
-  - Dimension 3: Fractal Behavior (TRENDING | MEAN_REVERTING)
+Detects current market regime using multiple models and routes signals
+to appropriate strategies based on regime compatibility.
 
-Features:
-  - 4-Layer Meta-Ensemble (HMM + LightGBM + Rules + Market Structure)
-  - Hysteresis Guard (Prevent Regime Flapping)
-  - Regime Transition Analysis
-  - Regime Stability Scoring
-  - Multi-Timeframe Reconciliation
-  - Choppy Market Detection Integration
-  - Market Killers Detection Integration
-  - Kelly Criterion Multiplier Mapping
+18 Market Regimes:
+  TREND (5):
+    1. HEALTHY_UPTREND: Strong bullish trend with healthy volume
+    2. HEALTHY_DOWNTREND: Strong bearish trend with healthy volume
+    3. QUIET_RALLY: Slow, steady uptrend with low volatility
+    4. SLOW_BLEED: Slow, steady downtrend with low volatility
+    5. FALSE_SIDEWAY: Range that's actually trending slowly
+
+  HIGH_VOL (4):
+    6. PARABOLIC_RALLY: Extreme bullish momentum, overextended
+    7. PANIC_CAPITULATION: Extreme bearish momentum, panic selling
+    8. VOLATILE_CHOP: High volatility with no clear direction
+    9. WHIPSAW_MARKET: Rapid direction changes, trap-heavy
+
+  SIDEWAY (5):
+    10. TIGHT_RANGE: Very narrow range, consolidation
+    11. CLASSIC_RANGE: Normal range-bound market
+    12. PRE_BREAKOUT: Range tightening before breakout
+    13. CONSOLIDATING_BULL: Bullish consolidation (flag/pennant)
+    14. CONSOLIDATING_BEAR: Bearish consolidation (flag/pennant)
+
+  REVERSAL (4):
+    15. OVERSOLD_BOUNCE: Oversold condition, bounce expected
+    16. EXHAUSTED_BULL: Bull trend exhausted, reversal likely
+    17. EXHAUSTED_BEAR: Bear trend exhausted, reversal likely
+    18. ANOMALY: Abnormal price action, unpredictable
+
+Unified Regimes (for Kelly sizing):
+  - TREND: For trend-following strategies
+  - SIDEWAY: For mean-reversion strategies
+  - HIGH_VOL: For scalping strategies
+  - REVERSAL: For counter-trend strategies
 """
 import pandas as pd
 import numpy as np
 import logging
 import pickle
-import os
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+from collections import deque
+
 from config import config
 
 
 class RegimeRouter:
     """
-    Routes trading strategies based on detected market regime.
-    Uses meta-ensemble of HMM, LightGBM, Rule-based, and Market Structure.
-    """
+    Detects current market regime and provides routing context.
     
-    def __init__(self, regime_model_path: str = None, lightgbm_models_path: str = None, **kwargs):
-        # =========================================================================
-        # PARAMETER BRIDGING (Compatibility with event_loop.py)
-        # =========================================================================
-        # event_loop.py may pass: rule_model_path, hmm_model_path, hybrid_model_path
-        if regime_model_path is None:
-            regime_model_path = kwargs.get('hmm_model_path', kwargs.get('rule_model_path', config.regime_model_path))
-        if lightgbm_models_path is None:
-            lightgbm_models_path = kwargs.get('hybrid_model_path', config.lightgbm_models_path)
-            
+    Features:
+      - Multi-model ensemble (HMM, Rule-based, LightGBM)
+      - 18-regime classification
+      - Choppy score detection (0-100)
+      - Market killers detection
+      - Regime stability tracking
+      - Kelly multiplier calculation
+      - Comprehensive regime context
+    """
+
+    # 18 Regime definitions
+    REGIMES = {
+        # TREND regimes
+        'HEALTHY_UPTREND': {'category': 'TREND', 'strength': 0.8},
+        'HEALTHY_DOWNTREND': {'category': 'TREND', 'strength': 0.8},
+        'QUIET_RALLY': {'category': 'TREND', 'strength': 0.6},
+        'SLOW_BLEED': {'category': 'TREND', 'strength': 0.6},
+        'FALSE_SIDEWAY': {'category': 'TREND', 'strength': 0.4},
+
+        # HIGH_VOL regimes
+        'PARABOLIC_RALLY': {'category': 'HIGH_VOL', 'strength': 0.9},
+        'PANIC_CAPITULATION': {'category': 'HIGH_VOL', 'strength': 0.9},
+        'VOLATILE_CHOP': {'category': 'HIGH_VOL', 'strength': 0.3},
+        'WHIPSAW_MARKET': {'category': 'HIGH_VOL', 'strength': 0.2},
+
+        # SIDEWAY regimes
+        'TIGHT_RANGE': {'category': 'SIDEWAY', 'strength': 0.7},
+        'CLASSIC_RANGE': {'category': 'SIDEWAY', 'strength': 0.6},
+        'PRE_BREAKOUT': {'category': 'SIDEWAY', 'strength': 0.5},
+        'CONSOLIDATING_BULL': {'category': 'SIDEWAY', 'strength': 0.6},
+        'CONSOLIDATING_BEAR': {'category': 'SIDEWAY', 'strength': 0.6},
+
+        # REVERSAL regimes
+        'OVERSOLD_BOUNCE': {'category': 'REVERSAL', 'strength': 0.7},
+        'EXHAUSTED_BULL': {'category': 'REVERSAL', 'strength': 0.6},
+        'EXHAUSTED_BEAR': {'category': 'REVERSAL', 'strength': 0.6},
+        'ANOMALY': {'category': 'REVERSAL', 'strength': 0.3}
+    }
+
+    def __init__(self):
+        """Initialize RegimeRouter with all sub-engines."""
         self.logger = logging.getLogger(self.__class__.__name__)
-        
-        # Initialize detectors
-        self.hmm_detector = HMMRegimeDetector(regime_model_path)
-        self.lightgbm_detector = LightGBMRegimeDetector(lightgbm_models_path)
-        self.rule_classifier = RuleBasedClassifier()
-        
-        # Hysteresis Guard (prevent regime flapping)
-        self.current_regime = 'UNKNOWN'
-        self.regime_history = []
-        self.regime_timestamps = []
-        self.max_history = 50
-        self.hysteresis_bars = 3
-        self.min_regime_duration_bars = 5
-        
-        # Transition tracking
-        self.last_transition_time = None
-        self.transition_count = 0
-        self.max_transitions_per_hour = 10
-        
-        # Market Structure Analyzer
-        try:
-            from core.market_structure_analyzer import MarketStructureAnalyzer
-            self.structure_analyzer = MarketStructureAnalyzer()
-        except ImportError:
-            self.structure_analyzer = None
-            self.logger.warning("[REGIME] MarketStructureAnalyzer not available")
-        
-        # Choppy Detector
+
+        # Load regime detection models
+        self.hmm_detector = None
+        self.rule_classifier = None
+        self.lgbm_predictor = None
+
+        self._load_models()
+
+        # Regime history for stability tracking (last 20 detections)
+        self._regime_history = deque(maxlen=20)
+        self._last_regime = 'UNKNOWN'
+        self._last_regime_time = None
+
+        # Choppy detector
         try:
             from core.choppy_detector import ChoppyDetector
             self.choppy_detector = ChoppyDetector()
         except ImportError:
             self.choppy_detector = None
-            self.logger.warning("[REGIME] ChoppyDetector not available")
-        
-        # Market Killers Detector
+
+        # Market killers detector
         try:
             from core.market_killers_detector import MarketKillersDetector
-            self.killers_detector = MarketKillersDetector(config.symbol)
+            self.killers_detector = MarketKillersDetector()
         except ImportError:
             self.killers_detector = None
-            self.logger.warning("[REGIME] MarketKillersDetector not available")
-        
-        # Regime-to-Strategy Weight Mapping
-        self.REGIME_WEIGHTS = {
-            'QUIET_RALLY': {'TREND': 0.7, 'SMC': 0.2, 'MEAN_REV': 0.05, 'SCALP': 0.05},
-            'ANOMALY_BULL': {'TREND': 0.3, 'SMC': 0.1, 'MEAN_REV': 0.4, 'SCALP': 0.2},
-            'HEALTHY_UPTREND': {'TREND': 0.8, 'SMC': 0.15, 'MEAN_REV': 0.0, 'SCALP': 0.05},
-            'CONSOLIDATING_BULL': {'TREND': 0.4, 'SMC': 0.3, 'MEAN_REV': 0.2, 'SCALP': 0.1},
-            'PARABOLIC_RALLY': {'TREND': 0.5, 'SMC': 0.1, 'MEAN_REV': 0.1, 'SCALP': 0.3},
-            'EXHAUSTED_BULL': {'TREND': 0.1, 'SMC': 0.2, 'MEAN_REV': 0.5, 'SCALP': 0.2},
-            'PRE_BREAKOUT': {'TREND': 0.3, 'SMC': 0.4, 'MEAN_REV': 0.2, 'SCALP': 0.1},
-            'TIGHT_RANGE': {'TREND': 0.0, 'SMC': 0.1, 'MEAN_REV': 0.7, 'SCALP': 0.2},
-            'FALSE_SIDEWAY': {'TREND': 0.4, 'SMC': 0.3, 'MEAN_REV': 0.2, 'SCALP': 0.1},
-            'CLASSIC_RANGE': {'TREND': 0.1, 'SMC': 0.2, 'MEAN_REV': 0.6, 'SCALP': 0.1},
-            'VOLATILE_CHOP': {'TREND': 0.0, 'SMC': 0.1, 'MEAN_REV': 0.3, 'SCALP': 0.6},
-            'WHIPSAW_MARKET': {'TREND': 0.0, 'SMC': 0.0, 'MEAN_REV': 0.2, 'SCALP': 0.8},
-            'SLOW_BLEED': {'TREND': 0.7, 'SMC': 0.2, 'MEAN_REV': 0.05, 'SCALP': 0.05},
-            'ANOMALY_BEAR': {'TREND': 0.3, 'SMC': 0.1, 'MEAN_REV': 0.4, 'SCALP': 0.2},
-            'HEALTHY_DOWNTREND': {'TREND': 0.8, 'SMC': 0.15, 'MEAN_REV': 0.0, 'SCALP': 0.05},
-            'CONSOLIDATING_BEAR': {'TREND': 0.4, 'SMC': 0.3, 'MEAN_REV': 0.2, 'SCALP': 0.1},
-            'PANIC_CAPITULATION': {'TREND': 0.5, 'SMC': 0.1, 'MEAN_REV': 0.1, 'SCALP': 0.3},
-            'OVERSOLD_BOUNCE': {'TREND': 0.1, 'SMC': 0.2, 'MEAN_REV': 0.5, 'SCALP': 0.2},
-            'UNKNOWN': {'TREND': 0.25, 'SMC': 0.25, 'MEAN_REV': 0.25, 'SCALP': 0.25}
-        }
-        
-        # Unified Regime Mapping for Kelly Criterion
-        self.UNIFIED_REGIME_MAP = {
-            'QUIET_RALLY': 'TREND',
-            'HEALTHY_UPTREND': 'TREND',
-            'PARABOLIC_RALLY': 'HIGH_VOL',
-            'SLOW_BLEED': 'TREND',
-            'HEALTHY_DOWNTREND': 'TREND',
-            'PANIC_CAPITULATION': 'HIGH_VOL',
-            'OVERSOLD_BOUNCE': 'REVERSAL',
-            'EXHAUSTED_BULL': 'REVERSAL',
-            'EXHAUSTED_BEAR': 'REVERSAL',
-            'ANOMALY_BULL': 'REVERSAL',
-            'ANOMALY_BEAR': 'REVERSAL',
-            'VOLATILE_CHOP': 'HIGH_VOL',
-            'WHIPSAW_MARKET': 'HIGH_VOL',
-            'TIGHT_RANGE': 'SIDEWAY',
-            'CLASSIC_RANGE': 'SIDEWAY',
-            'PRE_BREAKOUT': 'SIDEWAY',
-            'CONSOLIDATING_BULL': 'SIDEWAY',
-            'CONSOLIDATING_BEAR': 'SIDEWAY',
-            'FALSE_SIDEWAY': 'SIDEWAY'
-        }
-        
-        # Regime transition matrix (probability of transitioning from one regime to another)
-        self.transition_matrix = self._initialize_transition_matrix()
-    
+
+        # Session volatility manager
+        try:
+            from core.session_volatility import SessionVolatilityManager
+            self.session_mgr = SessionVolatilityManager()
+        except ImportError:
+            self.session_mgr = None
+
+        self.logger.info("[REGIME_ROUTER] Initialized with 18-regime detection")
+
+    # =========================================================================
+    # MODEL LOADING
+    # =========================================================================
+
+    def _load_models(self):
+        """Load regime detection models."""
+        # HMM Detector
+        try:
+            from core.hmm_regime_detector import HMMRegimeDetector
+            self.hmm_detector = HMMRegimeDetector()
+            self.logger.info("[REGIME_ROUTER] HMM detector loaded")
+        except Exception as e:
+            self.logger.warning(f"[REGIME_ROUTER] HMM detector not available: {e}")
+
+        # Rule-based Classifier
+        try:
+            from core.regime_classifier import RegimeClassifier
+            self.rule_classifier = RegimeClassifier()
+            self.logger.info("[REGIME_ROUTER] Rule classifier loaded")
+        except Exception as e:
+            self.logger.warning(f"[REGIME_ROUTER] Rule classifier not available: {e}")
+
+        # LightGBM Predictor
+        try:
+            from core.hybrid_mtf_predictor import HybridMTFPredictor
+            self.lgbm_predictor = HybridMTFPredictor()
+            self.logger.info("[REGIME_ROUTER] LightGBM predictor loaded")
+        except Exception as e:
+            self.logger.warning(f"[REGIME_ROUTER] LightGBM predictor not available: {e}")
+
+    # =========================================================================
+    # MAIN ENTRY POINT
+    # =========================================================================
+
     def detect_regime(self, data: Dict[str, pd.DataFrame]) -> Dict:
         """
-        Detect current market regime using meta-ensemble.
+        Detect current market regime from multi-timeframe data.
+        
+        Args:
+            data: Dict of timeframe -> DataFrame (M1, M5, M15, H1, etc.)
+            
+        Returns:
+            Comprehensive regime context dict with:
+              - regime_name: One of 18 regimes
+              - regime_category: TREND, SIDEWAY, HIGH_VOL, REVERSAL
+              - confidence: Detection confidence (0-1)
+              - choppy_score: Choppy market score (0-100)
+              - active_killers: List of market killer conditions
+              - kelly_multiplier: Position sizing multiplier
+              - session: Current trading session
+              - volatility_percentile: Current volatility vs historical
         """
-        df_m5 = data.get('M5')
+        # Get primary timeframe data
         df_m15 = data.get('M15')
+        df_m5 = data.get('M5')
         df_h1 = data.get('H1')
+
+        if df_m15 is None or df_m15.empty or len(df_m15) < 50:
+            return self._build_default_context('UNKNOWN', 'Unknown regime - insufficient data')
+
+        # =========================================================================
+        # STEP 1: Ensemble Regime Detection
+        # =========================================================================
+        regime_name, confidence = self._ensemble_regime_detection(
+            df_m15, df_m5, df_h1
+        )
+
+        # =========================================================================
+        # STEP 2: Get Regime Category
+        # =========================================================================
+        regime_info = self.REGIMES.get(regime_name, {'category': 'UNKNOWN', 'strength': 0.5})
+        regime_category = regime_info['category']
+        regime_strength = regime_info['strength']
+
+        # =========================================================================
+        # STEP 3: Detect Choppy Score
+        # =========================================================================
+        choppy_score = self._detect_choppy(df_m15, df_m5)
+
+        # =========================================================================
+        # STEP 4: Detect Market Killers
+        # =========================================================================
+        active_killers = self._detect_market_killers(df_m15, df_m5)
+
+        # =========================================================================
+        # STEP 5: Track Regime Stability
+        # =========================================================================
+        stability_info = self._track_regime_stability(regime_name)
+
+        # =========================================================================
+        # STEP 6: Calculate Kelly Multiplier
+        # =========================================================================
+        kelly_multiplier = self._calculate_kelly_multiplier(
+            regime_category, regime_strength, choppy_score, len(active_killers)
+        )
+
+        # =========================================================================
+        # STEP 7: Get Session Info
+        # =========================================================================
+        session_info = self._get_session_info(df_m15)
+
+        # =========================================================================
+        # STEP 8: Build Comprehensive Context
+        # =========================================================================
+        context = {
+            'regime_name': regime_name,
+            'regime_category': regime_category,
+            'regime_strength': regime_strength,
+            'confidence': confidence,
+            'choppy_score': choppy_score,
+            'active_killers': active_killers,
+            'kelly_multiplier': kelly_multiplier,
+            'session': session_info['session'],
+            'session_quality': session_info['quality_score'],
+            'volatility_percentile': session_info['volatility_percentile'],
+            'regime_stability': stability_info['stability_score'],
+            'regime_changes_last_20': stability_info['change_count'],
+            'is_stable_regime': stability_info['is_stable'],
+            'timestamp': datetime.now().isoformat()
+        }
+
+        # Log regime detection
+        self.logger.info(
+            f"[REGIME_ROUTER] {regime_name} | "
+            f"Category: {regime_category} | "
+            f"Confidence: {confidence:.2f} | "
+            f"Choppy: {choppy_score:.0f} | "
+            f"Killers: {len(active_killers)} | "
+            f"Kelly: {kelly_multiplier:.2f}x"
+        )
+
+        return context
+
+    # =========================================================================
+    # ENSEMBLE REGIME DETECTION
+    # =========================================================================
+
+    def _ensemble_regime_detection(self, df_m15: pd.DataFrame,
+                                     df_m5: pd.DataFrame = None,
+                                     df_h1: pd.DataFrame = None) -> Tuple[str, float]:
+        """
+        Ensemble multiple regime detection models.
         
-        if df_m5 is None or df_m5.empty:
-            return self._get_default_regime('Insufficient M5 data')
+        Voting weights:
+          - HMM: 0.4 (statistical)
+          - Rule-based: 0.35 (interpretable)
+          - LightGBM: 0.25 (ML)
         
-        # DIMENSION 1: Trend Direction (Meta-Ensemble)
-        trend_id, trend_name, trend_conf = self._get_trend_direction(df_m5, df_m15, df_h1)
+        Returns:
+            Tuple of (regime_name, confidence)
+        """
+        votes = {}
+        confidences = {}
+
+        # HMM Detection
+        if self.hmm_detector is not None:
+            try:
+                hmm_result = self.hmm_detector.detect_regime(df_m15)
+                if hmm_result and 'regime' in hmm_result:
+                    regime = hmm_result['regime']
+                    conf = hmm_result.get('confidence', 0.7)
+                    votes['HMM'] = regime
+                    confidences['HMM'] = conf
+            except Exception as e:
+                self.logger.debug(f"[REGIME_ROUTER] HMM detection error: {e}")
+
+        # Rule-based Detection
+        if self.rule_classifier is not None:
+            try:
+                rule_result = self.rule_classifier.classify(df_m15)
+                if rule_result and 'regime' in rule_result:
+                    regime = rule_result['regime']
+                    conf = rule_result.get('confidence', 0.6)
+                    votes['RULE'] = regime
+                    confidences['RULE'] = conf
+            except Exception as e:
+                self.logger.debug(f"[REGIME_ROUTER] Rule detection error: {e}")
+
+        # LightGBM Detection
+        if self.lgbm_predictor is not None:
+            try:
+                lgbm_result = self.lgbm_predictor.predict(df_m15, df_m5, df_h1)
+                if lgbm_result and 'regime' in lgbm_result:
+                    regime = lgbm_result['regime']
+                    conf = lgbm_result.get('confidence', 0.65)
+                    votes['LGBM'] = regime
+                    confidences['LGBM'] = conf
+            except Exception as e:
+                self.logger.debug(f"[REGIME_ROUTER] LightGBM detection error: {e}")
+
+        # No votes - return UNKNOWN
+        if not votes:
+            return 'UNKNOWN', 0.0
+
+        # Weighted voting
+        weights = {'HMM': 0.4, 'RULE': 0.35, 'LGBM': 0.25}
+
+        # Count weighted votes per regime
+        regime_scores = {}
+        for model, regime in votes.items():
+            weight = weights.get(model, 0.3)
+            conf = confidences.get(model, 0.5)
+            score = weight * conf
+
+            if regime not in regime_scores:
+                regime_scores[regime] = 0
+            regime_scores[regime] += score
+
+        # Get winning regime
+        if not regime_scores:
+            return 'UNKNOWN', 0.0
+
+        winning_regime = max(regime_scores.keys(), key=lambda r: regime_scores[r])
+        winning_score = regime_scores[winning_regime]
+
+        # Calculate confidence (normalized to 0-1)
+        max_possible_score = sum(weights.values())
+        confidence = min(1.0, winning_score / max_possible_score)
+
+        # Validate regime is in our 18 regimes
+        if winning_regime not in self.REGIMES:
+            # Try to map to closest regime
+            winning_regime = self._map_to_18_regimes(winning_regime, df_m15)
+
+        return winning_regime, confidence
+
+    def _map_to_18_regimes(self, raw_regime: str, df: pd.DataFrame) -> str:
+        """Map raw regime name to one of 18 defined regimes."""
+        # Common mappings
+        mappings = {
+            'TRENDING_UP': 'HEALTHY_UPTREND',
+            'TRENDING_DOWN': 'HEALTHY_DOWNTREND',
+            'RANGING': 'CLASSIC_RANGE',
+            'HIGH_VOLATILITY': 'VOLATILE_CHOP',
+            'LOW_VOLATILITY': 'TIGHT_RANGE',
+            'BREAKOUT': 'PRE_BREAKOUT',
+            'REVERSAL_UP': 'OVERSOLD_BOUNCE',
+            'REVERSAL_DOWN': 'EXHAUSTED_BULL'
+        }
+
+        if raw_regime in mappings:
+            return mappings[raw_regime]
+
+        # Fallback: analyze df to determine regime
+        if df is not None and len(df) >= 20:
+            return self._classify_from_price_action(df)
+
+        return 'CLASSIC_RANGE'
+
+    def _classify_from_price_action(self, df: pd.DataFrame) -> str:
+        """Classify regime from price action when models fail."""
+        try:
+            close = df['close'].values.astype(float)
+            high = df['high'].values.astype(float)
+            low = df['low'].values.astype(float)
+
+            if len(close) < 20:
+                return 'CLASSIC_RANGE'
+
+            # Calculate basic metrics
+            recent_close = close[-1]
+            sma_20 = np.mean(close[-20:])
+            sma_50 = np.mean(close[-50:]) if len(close) >= 50 else sma_20
+
+            # Price range
+            range_20 = np.max(high[-20:]) - np.min(low[-20:])
+            range_pct = range_20 / recent_close * 100
+
+            # Trend detection
+            if recent_close > sma_20 > sma_50:
+                if range_pct > 5:
+                    return 'HEALTHY_UPTREND'
+                else:
+                    return 'QUIET_RALLY'
+            elif recent_close < sma_20 < sma_50:
+                if range_pct > 5:
+                    return 'HEALTHY_DOWNTREND'
+                else:
+                    return 'SLOW_BLEED'
+            elif range_pct < 2:
+                return 'TIGHT_RANGE'
+            elif range_pct < 4:
+                return 'CLASSIC_RANGE'
+            else:
+                return 'VOLATILE_CHOP'
+
+        except Exception:
+            return 'CLASSIC_RANGE'
+
+    # =========================================================================
+    # CHOPPY DETECTION
+    # =========================================================================
+
+    def _detect_choppy(self, df_m15: pd.DataFrame,
+                        df_m5: pd.DataFrame = None) -> float:
+        """
+        Calculate choppy score (0-100).
         
-        # DIMENSION 2: Volatility Level (Bollinger Band Width Percentile)
-        vol_id, vol_name, vol_conf = self._get_volatility_level(df_m5)
-        
-        # DIMENSION 3: Fractal Behavior (Hurst Exponent)
-        fractal_id, fractal_name, fractal_conf, hurst_value = self._get_fractal_behavior(df_m5)
-        
-        # COMBINE 3 DIMENSIONS -> 18 REGIMES
-        regime_name, regime_id = self._combine_dimensions(trend_id, vol_id, fractal_id)
-        
-        # HYSTERESIS GUARD (Prevent Regime Flapping)
-        final_regime = self._apply_hysteresis(regime_name)
-        
-        # REGIME STABILITY ANALYSIS
-        regime_stability = self._calculate_regime_stability()
-        transition_probability = self._calculate_transition_probability(final_regime)
-        
-        # CHOPPY DETECTION (Optional Enhancement)
-        choppy_score = 0.0
-        choppy_severity = 'NONE'
+        High choppy score (>65) indicates market is too choppy for most strategies.
+        """
         if self.choppy_detector is not None:
             try:
-                choppy_result = self.choppy_detector.detect_choppy(df_m5, hurst_value)
-                choppy_score = choppy_result.get('choppy_score', 0.0)
-                choppy_severity = choppy_result.get('severity', 'NONE')
+                result = self.choppy_detector.calculate_choppy_score(df_m15, df_m5)
+                if result and 'score' in result:
+                    return float(result['score'])
             except Exception as e:
-                self.logger.error(f"[REGIME] Choppy detection error: {e}")
+                self.logger.debug(f"[REGIME_ROUTER] Choppy detection error: {e}")
+
+        # Fallback: Simple choppy calculation
+        return self._simple_choppy_score(df_m15)
+
+    def _simple_choppy_score(self, df: pd.DataFrame) -> float:
+        """Simple choppy score based on direction changes."""
+        try:
+            if df is None or len(df) < 20:
+                return 50.0
+
+            close = df['close'].values.astype(float)
+            changes = np.diff(close)
+
+            # Count direction changes
+            direction_changes = np.sum(np.diff(np.sign(changes)) != 0)
+            max_changes = len(changes) - 1
+
+            if max_changes == 0:
+                return 50.0
+
+            choppy_ratio = direction_changes / max_changes
+            score = choppy_ratio * 100
+
+            return max(0, min(100, score))
+
+        except Exception:
+            return 50.0
+
+    # =========================================================================
+    # MARKET KILLERS DETECTION
+    # =========================================================================
+
+    def _detect_market_killers(self, df_m15: pd.DataFrame,
+                                 df_m5: pd.DataFrame = None) -> List[str]:
+        """
+        Detect market killer conditions that make trading dangerous.
         
-        # MARKET KILLERS DETECTION (Optional Enhancement)
-        active_killers = []
-        killers_multiplier = 1.0
+        Returns:
+            List of active killer condition names
+        """
         if self.killers_detector is not None:
             try:
-                killers_report = self.killers_detector.detect_all_killers(df_m5, None)
-                active_killers = killers_report.get('active_killers', [])
-                killers_multiplier = self.killers_detector.get_position_size_multiplier(killers_report)
+                result = self.killers_detector.detect_killers(df_m15, df_m5)
+                if result and 'active_killers' in result:
+                    return result['active_killers']
             except Exception as e:
-                self.logger.error(f"[REGIME] Market killers detection error: {e}")
-        
-        # KELLY MULTIPLIER (Based on Unified Regime)
-        unified_regime = self.UNIFIED_REGIME_MAP.get(final_regime, 'SIDEWAY')
-        kelly_multiplier = self._get_kelly_multiplier(unified_regime)
-        
-        # Apply killers multiplier
-        kelly_multiplier *= killers_multiplier
-        
-        # Apply choppy reduction
-        if choppy_severity in ['EXTREME', 'HIGH']:
-            kelly_multiplier *= 0.5
-        
-        # BUILD RESULT
-        result = {
-            'regime_name': final_regime,
-            'regime_id': regime_id,
-            'confidence': trend_conf * 0.5 + vol_conf * 0.3 + fractal_conf * 0.2,
-            'unified_regime': unified_regime,
-            'trend_direction': trend_name,
-            'volatility_level': vol_name,
-            'fractal_behavior': fractal_name,
-            'hurst_value': hurst_value,
-            'kelly_multiplier': kelly_multiplier,
-            'choppy_score': choppy_score,
-            'choppy_severity': choppy_severity,
-            'active_killers': active_killers,
-            'killers_multiplier': killers_multiplier,
-            'regime_stability': regime_stability,
-            'transition_probability': transition_probability,
-            'details': {
-                'trend_confidence': trend_conf,
-                'volatility_confidence': vol_conf,
-                'fractal_confidence': fractal_conf,
-                'trend_id': trend_id,
-                'vol_id': vol_id,
-                'fractal_id': fractal_id
-            }
-        }
-        
-        # self.logger.info(
-        #     f"[REGIME] {final_regime} | Unified: {unified_regime} | "
-        #     f"Conf: {result['confidence']:.2%} | "
-        #     f"Kelly: {kelly_multiplier:.2f}x | "
-        #     f"Stability: {regime_stability:.2f} | "
-        #     f"Choppy: {choppy_score:.0f} | "
-        #     f"Killers: {len(active_killers)}"
-        # )
-        # Log only on regime change (reduce noise)
-        if final_regime != self.current_regime or self.current_regime == 'UNKNOWN':
-            self.logger.info(
-                f"[REGIME CHANGE] {final_regime} | Unified: {unified_regime} | "
-                f"Conf: {result['confidence']:.2%} | "
-                f"Kelly: {kelly_multiplier:.2f}x | "
-                f"Stability: {regime_stability:.2f} | "
-                f"Choppy: {choppy_score:.0f} | "
-                f"Killers: {len(active_killers)}"
-            )
-        else:
-            # Optional: Log at DEBUG level for detailed monitoring
-            self.logger.debug(
-                f"[REGIME] {final_regime} | Kelly: {kelly_multiplier:.2f}x | "
-                f"Choppy: {choppy_score:.0f} | Killers: {len(active_killers)}"
-            )
-        
-        return result
+                self.logger.debug(f"[REGIME_ROUTER] Killers detection error: {e}")
 
-    def analyze_and_route(self, df_m5: pd.DataFrame, df_m15: pd.DataFrame = None,
-                          df_h1: pd.DataFrame = None, strategy_signals: Dict = None) -> Dict:
-        """
-        Bridge method for EventLoop compatibility.
-        Wraps detect_regime() and maps output keys to match EventLoop expectations.
-        """
-        data = {
-            'M5': df_m5,
-            'M15': df_m15,
-            'H1': df_h1
-        }
-        
-        # Call the core detection method
-        result = self.detect_regime(data)
-        
-        # Map keys to match EventLoop's _build_context expectations
-        mapped_result = {
-            'regime_name': result.get('regime_name', 'UNKNOWN'),
-            'regime_id': result.get('regime_id', 18),
-            'unified_regime': result.get('unified_regime', 'SIDEWAY'),
-            'regime': result.get('unified_regime', 'SIDEWAY'),
-            
-            # EventLoop expects 'trend', 'volatility', 'fractal'
-            'trend': result.get('trend_direction', 'UNKNOWN'),
-            'volatility': result.get('volatility_level', 'NORMAL'),
-            'fractal': result.get('fractal_behavior', 'TRENDING'),
-            
-            # Confidence and percentiles
-            'trend_confidence': result.get('details', {}).get('trend_confidence', result.get('confidence', 0.5)),
-            'vol_percentile': result.get('details', {}).get('volatility_confidence', 0.5),
-            'hurst_value': result.get('hurst_value', 0.5),
-            
-            # Multipliers and Modifiers
-            'kelly_multiplier': result.get('kelly_multiplier', 1.0),
-            'killers_multiplier': result.get('killers_multiplier', 1.0),
-            'choppy_score': result.get('choppy_score', 0.0),
-            'choppy_severity': result.get('choppy_severity', 'NONE'),
-            'active_killers': result.get('active_killers', []),
-            
-            # Stability
-            'regime_stability': result.get('regime_stability', 0.5),
-            'transition_probability': result.get('transition_probability', 0.5),
-            
-            # Weights & Features
-            'weights': self.get_regime_weights(result.get('regime_name', 'UNKNOWN')),
-            'recommended_strategies': [],
-            'features': {}
-        }
-        
-        return mapped_result    
-    
-    def _get_trend_direction(self, df_m5: pd.DataFrame, df_m15: pd.DataFrame,
-                             df_h1: pd.DataFrame) -> Tuple[int, str, float]:
-        """Layer 1: Determine trend direction using 4-layer meta-ensemble."""
-        # Layer 1A: HMM
-        hmm_id, hmm_conf, hmm_details = None, 0.0, {}
-        if self.hmm_detector.is_trained:
-            hmm_df = df_m15 if df_m15 is not None else df_m5
-            hmm_id, hmm_conf, hmm_details = self.hmm_detector.predict(hmm_df)
-            hmm_name = HMMRegimeDetector.REGIME_NAMES.get(hmm_id, 'UNKNOWN')
-        else:
-            hmm_name = 'NOT_TRAINED'
-        
-        # Layer 1B: Rule-based
-        rule_features = self.rule_classifier.extract_features(df_m5, df_m15, df_h1)
-        rule_id, rule_name, rule_conf = self.rule_classifier.classify_regime(rule_features)
-        
-        # Layer 1C: Hybrid (LightGBM)
-        hybrid_result = self.get_hybrid_prediction(df_m5, df_m15, df_h1)
-        
-        # Layer 1D: Market Structure (Non-Lagging)
-        if self.structure_analyzer is not None:
-            structure_df = df_m15 if df_m15 is not None else df_m5
-            structure_score, structure_reason = self.structure_analyzer.get_trend_score(structure_df)
-            structure_result = self.structure_analyzer.analyze_market_structure(structure_df)
-            
-            if structure_score >= 2:
-                structure_id = 0  # BULL
-                structure_name = 'BULL_STRUCTURE'
-                structure_conf = structure_result['confidence'] / 100.0
-            elif structure_score <= -2:
-                structure_id = 1  # BEAR
-                structure_name = 'BEAR_STRUCTURE'
-                structure_conf = structure_result['confidence'] / 100.0
-            elif structure_score == 1:
-                structure_id = 0  # Weak BULL
-                structure_name = 'WEAK_BULL_STRUCTURE'
-                structure_conf = 0.5
-            elif structure_score == -1:
-                structure_id = 1  # Weak BEAR
-                structure_name = 'WEAK_BEAR_STRUCTURE'
-                structure_conf = 0.5
-            else:
-                structure_id = 2  # SIDEWAY
-                structure_name = 'TRANSITION_STRUCTURE'
-                structure_conf = 0.4
-            
-            self.logger.debug(f"[STRUCTURE] {structure_name} | Score: {structure_score}")
-        else:
-            structure_id, structure_name, structure_conf = 2, 'NO_STRUCTURE', 0.0
-        
-        # Meta-Ensemble: 4 Layers (Weighted Voting)
-        final_id, final_name, final_conf = self._meta_ensemble_trend_4layers(
-            rule_id, rule_name, rule_conf,
-            hmm_id, hmm_name, hmm_conf,
-            hybrid_result,
-            structure_id, structure_name, structure_conf
-        )
-        
-        return final_id, final_name, final_conf
-    
-    def _meta_ensemble_trend_4layers(self, rule_id, rule_name, rule_conf,
-                                     hmm_id, hmm_name, hmm_conf,
-                                     hybrid_result,
-                                     structure_id, structure_name, structure_conf) -> Tuple[int, str, float]:
-        """Enhanced Meta-Ensemble with 4 layers (Weighted Voting)."""
-        votes = {0: 0.0, 1: 0.0, 2: 0.0}  # BULL, BEAR, SIDEWAY
-        
-        if rule_id in [0, 1, 2]:
-            votes[rule_id] += rule_conf * 0.15
-        
-        if hmm_id is not None and hmm_id in [0, 1, 2]:
-            votes[hmm_id] += hmm_conf * 0.25
-        
-        if hybrid_result.get('prediction') is not None:
-            hybrid_pred = hybrid_result['prediction']
-            hybrid_conf = hybrid_result.get('confidence', 0.5)
-            if hybrid_pred == 'UP':
-                votes[0] += hybrid_conf * 0.35
-            elif hybrid_pred == 'DOWN':
-                votes[1] += hybrid_conf * 0.35
-            else:
-                votes[2] += hybrid_conf * 0.35
-        
-        if structure_id in [0, 1, 2]:
-            votes[structure_id] += structure_conf * 0.25
-        
-        total_weight = sum(votes.values())
-        if total_weight == 0:
-            return 2, 'SIDEWAY', 0.5
-        
-        for k in votes:
-            votes[k] /= total_weight
-        
-        winner_id = max(votes, key=votes.get)
-        winner_conf = votes[winner_id]
-        
-        regime_names = {0: 'BULL_TREND', 1: 'BEAR_TREND', 2: 'SIDEWAY'}
-        winner_name = regime_names[winner_id]
-        
-        self.logger.debug(
-            f"[META-ENSEMBLE] {winner_name} ({winner_conf:.2%}) | "
-            f"Votes: BULL={votes[0]:.2f}, BEAR={votes[1]:.2f}, SIDEWAY={votes[2]:.2f}"
-        )
-        
-        return winner_id, winner_name, winner_conf
-    
-    def _get_volatility_level(self, df: pd.DataFrame) -> Tuple[int, str, float]:
-        """Layer 2: Determine volatility level using Bollinger Band Width Percentile."""
-        if df is None or len(df) < 100:
-            return 1, 'NORMAL_VOL', 0.5
-        
+        # Fallback: Basic killer detection
+        return self._simple_killers_detection(df_m15)
+
+    def _simple_killers_detection(self, df: pd.DataFrame) -> List[str]:
+        """Simple market killers detection."""
+        killers = []
+
         try:
-            close = df['close'].values
-            period = 20
-            
-            sma = pd.Series(close).rolling(window=period, min_periods=period).mean()
-            std = pd.Series(close).rolling(window=period, min_periods=period).std()
-            bb_width = (4 * std / (sma + 1e-10)) * 100
-            
-            recent_widths = bb_width.iloc[-100:]
-            current_width = bb_width.iloc[-1]
-            
-            if pd.isna(current_width):
-                return 1, 'NORMAL_VOL', 0.5
-            
-            percentile = (recent_widths < current_width).sum() / len(recent_widths)
-            
-            if percentile < 0.20:
-                return 0, 'LOW_VOL', 1.0 - percentile
-            elif percentile > 0.80:
-                return 2, 'HIGH_VOL', percentile
-            else:
-                return 1, 'NORMAL_VOL', 0.5 + abs(percentile - 0.5)
-                
-        except Exception as e:
-            self.logger.error(f"[VOL] Error: {e}")
-            return 1, 'NORMAL_VOL', 0.5
-    
-    def _get_fractal_behavior(self, df: pd.DataFrame) -> Tuple[int, str, float, float]:
-        """Layer 3: Determine fractal behavior using Hurst Exponent."""
-        if df is None or len(df) < 50:
-            return 0, 'TRENDING', 0.5, 0.55
+            if df is None or len(df) < 20:
+                return killers
+
+            close = df['close'].values.astype(float)
+            high = df['high'].values.astype(float)
+            low = df['low'].values.astype(float)
+
+            # Volume spike (if available)
+            if 'tick_volume' in df.columns:
+                volume = df['tick_volume'].values.astype(float)
+                avg_volume = np.mean(volume[-20:])
+                current_volume = volume[-1]
+
+                if current_volume > avg_volume * 3:
+                    killers.append('VOLUME_SPIKE')
+
+            # Price gap
+            if len(close) >= 2:
+                gap = abs(close[-1] - close[-2])
+                avg_range = np.mean(high[-20:] - low[-20:])
+
+                if gap > avg_range * 2:
+                    killers.append('PRICE_GAP')
+
+            # Extreme volatility
+            tr = np.maximum(high[1:] - low[1:],
+                            np.maximum(np.abs(high[1:] - close[:-1]),
+                                       np.abs(low[1:] - close[:-1])))
+            current_tr = tr[-1]
+            avg_tr = np.mean(tr[-20:])
+
+            if current_tr > avg_tr * 3:
+                killers.append('EXTREME_VOLATILITY')
+
+        except Exception:
+            pass
+
+        return killers
+
+    # =========================================================================
+    # REGIME STABILITY TRACKING
+    # =========================================================================
+
+    def _track_regime_stability(self, current_regime: str) -> Dict:
+        """
+        Track regime stability over time.
         
-        try:
-            from core.hurst_wavelet_engine import HurstWaveletEngine
-            hurst_engine = HurstWaveletEngine()
-            hurst_value = hurst_engine.calculate_hurst_exponent(df['close'], max_lag=50)
-            
-            if hurst_value > 0.55:
-                return 0, 'TRENDING', min(1.0, (hurst_value - 0.5) * 4), hurst_value
-            elif hurst_value < 0.45:
-                return 1, 'MEAN_REVERTING', min(1.0, (0.5 - hurst_value) * 4), hurst_value
-            else:
-                return 0, 'TRENDING', 0.5, hurst_value
-                
-        except Exception as e:
-            self.logger.error(f"[HURST] Error: {e}")
-            return 0, 'TRENDING', 0.5, 0.55
-    
-    def _combine_dimensions(self, trend_id: int, vol_id: int, fractal_id: int) -> Tuple[str, int]:
-        """Combine 3 dimensions into 18 regime combinations."""
-        regime_map = {
-            (0, 0, 0): ('QUIET_RALLY', 0), (0, 0, 1): ('ANOMALY_BULL', 1),
-            (0, 1, 0): ('HEALTHY_UPTREND', 2), (0, 1, 1): ('CONSOLIDATING_BULL', 3),
-            (0, 2, 0): ('PARABOLIC_RALLY', 4), (0, 2, 1): ('EXHAUSTED_BULL', 5),
-            (2, 0, 0): ('PRE_BREAKOUT', 6), (2, 0, 1): ('TIGHT_RANGE', 7),
-            (2, 1, 0): ('FALSE_SIDEWAY', 8), (2, 1, 1): ('CLASSIC_RANGE', 9),
-            (2, 2, 0): ('VOLATILE_CHOP', 10), (2, 2, 1): ('WHIPSAW_MARKET', 11),
-            (1, 0, 0): ('SLOW_BLEED', 12), (1, 0, 1): ('ANOMALY_BEAR', 13),
-            (1, 1, 0): ('HEALTHY_DOWNTREND', 14), (1, 1, 1): ('CONSOLIDATING_BEAR', 15),
-            (1, 2, 0): ('PANIC_CAPITULATION', 16), (1, 2, 1): ('OVERSOLD_BOUNCE', 17),
+        Returns:
+            Dict with stability metrics
+        """
+        # Add to history
+        self._regime_history.append(current_regime)
+
+        # Count regime changes in last 20
+        change_count = 0
+        for i in range(1, len(self._regime_history)):
+            if self._regime_history[i] != self._regime_history[i-1]:
+                change_count += 1
+
+        # Calculate stability score (0-100)
+        # Fewer changes = higher stability
+        stability_score = max(0, 100 - (change_count * 10))
+
+        # Determine if regime is stable
+        is_stable = stability_score >= 60
+
+        # Track regime transition
+        if self._last_regime != current_regime and self._last_regime != 'UNKNOWN':
+            self.logger.info(
+                f"[REGIME_ROUTER] Regime transition: "
+                f"{self._last_regime} -> {current_regime}"
+            )
+
+        self._last_regime = current_regime
+        self._last_regime_time = datetime.now()
+
+        return {
+            'stability_score': stability_score,
+            'change_count': change_count,
+            'is_stable': is_stable,
+            'history_length': len(self._regime_history)
         }
+
+    # =========================================================================
+    # KELLY MULTIPLIER CALCULATION
+    # =========================================================================
+
+    def _calculate_kelly_multiplier(self, regime_category: str,
+                                     regime_strength: float,
+                                     choppy_score: float,
+                                     num_killers: int) -> float:
+        """
+        Calculate Kelly position sizing multiplier based on regime.
         
-        key = (trend_id, vol_id, fractal_id)
-        if key in regime_map:
-            return regime_map[key]
-        else:
-            return 'UNKNOWN', 18
-    
-    def _apply_hysteresis(self, new_regime: str) -> str:
-        """Apply hysteresis guard to prevent regime flapping."""
-        current_time = datetime.now()
-        
-        self.regime_history.append(new_regime)
-        self.regime_timestamps.append(current_time)
-        
-        if len(self.regime_history) > self.max_history:
-            self.regime_history.pop(0)
-            self.regime_timestamps.pop(0)
-        
-        if len(self.regime_history) >= self.hysteresis_bars:
-            recent = self.regime_history[-self.hysteresis_bars:]
-            if all(r == new_regime for r in recent):
-                if new_regime != self.current_regime:
-                    self._record_transition(self.current_regime, new_regime, current_time)
-                self.current_regime = new_regime
-                return new_regime
-            else:
-                return self.current_regime
-        else:
-            self.current_regime = new_regime
-            return new_regime
-    
-    def _record_transition(self, from_regime: str, to_regime: str, timestamp: datetime):
-        """Record regime transition for analysis."""
-        self.transition_count += 1
-        self.last_transition_time = timestamp
-        
-        if from_regime in self.transition_matrix and to_regime in self.transition_matrix[from_regime]:
-            self.transition_matrix[from_regime][to_regime] += 1
-        
-        self.logger.info(f"[REGIME] Transition: {from_regime} -> {to_regime}")
-    
-    def _calculate_regime_stability(self) -> float:
-        """Calculate regime stability score (0-1)."""
-        if len(self.regime_history) < 10:
-            return 0.5
-        
-        recent = self.regime_history[-10:]
-        changes = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
-        stability = 1.0 - (changes / 9.0)
-        
-        return max(0.0, min(1.0, stability))
-    
-    def _calculate_transition_probability(self, current_regime: str) -> float:
-        """Calculate probability of regime changing in next bar."""
-        if current_regime not in self.transition_matrix:
-            return 0.5
-        
-        total_transitions = sum(self.transition_matrix[current_regime].values())
-        if total_transitions == 0:
-            return 0.5
-        
-        different_transitions = sum(
-            count for regime, count in self.transition_matrix[current_regime].items()
-            if regime != current_regime
-        )
-        
-        probability = different_transitions / total_transitions
-        return max(0.0, min(1.0, probability))
-    
-    def _initialize_transition_matrix(self) -> Dict:
-        """Initialize regime transition matrix."""
-        regimes = [
-            'QUIET_RALLY', 'ANOMALY_BULL', 'HEALTHY_UPTREND', 'CONSOLIDATING_BULL',
-            'PARABOLIC_RALLY', 'EXHAUSTED_BULL', 'PRE_BREAKOUT', 'TIGHT_RANGE',
-            'FALSE_SIDEWAY', 'CLASSIC_RANGE', 'VOLATILE_CHOP', 'WHIPSAW_MARKET',
-            'SLOW_BLEED', 'ANOMALY_BEAR', 'HEALTHY_DOWNTREND', 'CONSOLIDATING_BEAR',
-            'PANIC_CAPITULATION', 'OVERSOLD_BOUNCE', 'UNKNOWN'
-        ]
-        
-        matrix = {}
-        for from_regime in regimes:
-            matrix[from_regime] = {to_regime: 0 for to_regime in regimes}
-        
-        return matrix
-    
-    def _get_kelly_multiplier(self, unified_regime: str) -> float:
-        """Get Kelly multiplier based on unified regime."""
-        multipliers = {
+        Returns:
+            Multiplier (0.0 to 2.0)
+        """
+        # Base multiplier by regime category
+        base_multipliers = {
             'TREND': 1.5,
             'SIDEWAY': 1.0,
             'HIGH_VOL': 0.7,
-            'REVERSAL': 0.8
+            'REVERSAL': 1.2,
+            'UNKNOWN': 0.5
         }
-        return multipliers.get(unified_regime, 1.0)
-    
-    def _get_default_regime(self, reason: str) -> Dict:
-        """Return default regime when detection fails."""
-        return {
-            'regime_name': 'UNKNOWN', 'regime_id': 18, 'confidence': 0.0,
-            'unified_regime': 'SIDEWAY', 'trend_direction': 'UNKNOWN',
-            'volatility_level': 'UNKNOWN', 'fractal_behavior': 'UNKNOWN',
-            'hurst_value': 0.5, 'kelly_multiplier': 1.0, 'choppy_score': 0.0,
-            'choppy_severity': 'NONE', 'active_killers': [], 'killers_multiplier': 1.0,
-            'regime_stability': 0.5, 'transition_probability': 0.5,
-            'details': {'reason': reason}
-        }
-    
-    def get_hybrid_prediction(self, df_m5: pd.DataFrame, df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> Dict:
-        """Get prediction from LightGBM hybrid model."""
-        if not self.lightgbm_detector.is_trained:
-            return {'prediction': None, 'confidence': 0.0}
-        
-        try:
-            prediction = self.lightgbm_detector.predict(df_m5, df_m15, df_h1)
-            return prediction
-        except Exception as e:
-            self.logger.error(f"[HYBRID] Error: {e}")
-            return {'prediction': None, 'confidence': 0.0}
-    
-    def get_regime_summary(self) -> Dict:
-        """Get current regime summary for logging."""
-        return {
-            'current_regime': self.current_regime,
-            'history_length': len(self.regime_history),
-            'recent_regimes': self.regime_history[-5:] if len(self.regime_history) >= 5 else self.regime_history,
-            'transition_count': self.transition_count,
-            'last_transition': self.last_transition_time.isoformat() if self.last_transition_time else None,
-            'regime_stability': self._calculate_regime_stability()
-        }
-    
-    def get_regime_weights(self, regime_name: str) -> Dict:
-        """Get strategy weights for a specific regime."""
-        return self.REGIME_WEIGHTS.get(regime_name, self.REGIME_WEIGHTS['UNKNOWN'])
-    
-    def analyze_regime_transitions(self) -> Dict:
-        """Analyze regime transition patterns."""
-        analysis = {
-            'total_transitions': self.transition_count,
-            'most_common_transitions': [],
-            'average_regime_duration': 0.0
-        }
-        
-        transition_counts = []
-        for from_regime, transitions in self.transition_matrix.items():
-            for to_regime, count in transitions.items():
-                if count > 0 and from_regime != to_regime:
-                    transition_counts.append({'from': from_regime, 'to': to_regime, 'count': count})
-        
-        transition_counts.sort(key=lambda x: x['count'], reverse=True)
-        analysis['most_common_transitions'] = transition_counts[:10]
-        
-        if len(self.regime_history) >= 10:
-            durations = []
-            current_regime = self.regime_history[0]
-            duration = 1
-            
-            for i in range(1, len(self.regime_history)):
-                if self.regime_history[i] == current_regime:
-                    duration += 1
-                else:
-                    durations.append(duration)
-                    current_regime = self.regime_history[i]
-                    duration = 1
-            
-            if durations:
-                analysis['average_regime_duration'] = np.mean(durations)
-        
-        return analysis
 
+        base_mult = base_multipliers.get(regime_category, 1.0)
 
-# ============================================================================
-# HMM REGIME DETECTOR
-# ============================================================================
-class HMMRegimeDetector:
-    """Hidden Markov Model for regime detection."""
-    
-    REGIME_NAMES = {0: 'BULL', 1: 'BEAR', 2: 'SIDEWAY'}
-    
-    def __init__(self, model_path: str):
-        self.model_path = model_path
-        self.model = None
-        self.is_trained = False
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self._load_model()
-    
-    def _load_model(self):
-        """Load pre-trained HMM model."""
-        if os.path.exists(self.model_path):
+        # Adjust by regime strength
+        strength_mult = 0.5 + (regime_strength * 0.5)  # 0.5 to 1.0
+
+        # Adjust by choppy score
+        if choppy_score > 65:
+            choppy_mult = 0.5  # High choppy = reduce size
+        elif choppy_score > 50:
+            choppy_mult = 0.75
+        else:
+            choppy_mult = 1.0
+
+        # Adjust by killers
+        killer_mult = max(0.3, 1.0 - (num_killers * 0.2))
+
+        # Final multiplier
+        final_mult = base_mult * strength_mult * choppy_mult * killer_mult
+
+        # Clamp to reasonable range
+        return max(0.0, min(2.0, final_mult))
+
+    # =========================================================================
+    # SESSION INFO
+    # =========================================================================
+
+    def _get_session_info(self, df: pd.DataFrame) -> Dict:
+        """Get current session information."""
+        result = {
+            'session': 'OTHER',
+            'quality_score': 50.0,
+            'volatility_percentile': 50.0
+        }
+
+        if self.session_mgr is not None:
             try:
-                with open(self.model_path, 'rb') as f:
-                    self.model = pickle.load(f)
-                self.is_trained = True
-                self.logger.info(f"[HMM] Loaded model from {self.model_path}")
+                session = self.session_mgr.get_session_from_dataframe(df)
+                quality = self.session_mgr.get_session_quality_score(session, df)
+                volatility = self.session_mgr.calculate_session_volatility(df, session)
+
+                result['session'] = session
+                result['quality_score'] = quality.get('quality_score', 50.0)
+                result['volatility_percentile'] = volatility.get('volatility_percentile', 50.0)
+
             except Exception as e:
-                self.logger.error(f"[HMM] Failed to load model: {e}")
-                self.is_trained = False
-        else:
-            self.logger.warning(f"[HMM] Model not found at {self.model_path}")
-            self.is_trained = False
-    
-    def predict(self, df: pd.DataFrame) -> Tuple[int, float, Dict]:
-        """Predict regime using HMM."""
-        if not self.is_trained or df is None or len(df) < 20:
-            return 2, 0.5, {'reason': 'Model not trained or insufficient data'}
+                self.logger.debug(f"[REGIME_ROUTER] Session info error: {e}")
+
+        return result
+
+    # =========================================================================
+    # UTILITY METHODS
+    # =========================================================================
+
+    def _build_default_context(self, regime_name: str, reason: str) -> Dict:
+        """Build default context when detection fails."""
+        return {
+            'regime_name': regime_name,
+            'regime_category': 'UNKNOWN',
+            'regime_strength': 0.5,
+            'confidence': 0.0,
+            'choppy_score': 50.0,
+            'active_killers': [],
+            'kelly_multiplier': 1.0,
+            'session': 'OTHER',
+            'session_quality': 50.0,
+            'volatility_percentile': 50.0,
+            'regime_stability': 50.0,
+            'regime_changes_last_20': 0,
+            'is_stable_regime': True,
+            'reason': reason,
+            'timestamp': datetime.now().isoformat()
+        }
+
+    def get_regime_stats(self) -> Dict:
+        """
+        Get statistics on regime detection performance.
         
-        try:
-            returns = df['close'].pct_change().dropna().values[-20:]
-            volatility = df['close'].rolling(10).std().dropna().values[-20:]
-            
-            features = np.column_stack([returns, volatility])
-            states = self.model.predict(features)
-            current_state = int(states[-1])
-            
-            probabilities = self.model.predict_proba(features)
-            confidence = float(probabilities[-1].max())
-            
-            return current_state, confidence, {'states': states.tolist()}
-            
-        except Exception as e:
-            self.logger.error(f"[HMM] Prediction error: {e}")
-            return 2, 0.5, {'error': str(e)}
+        Returns:
+            Dict with regime statistics
+        """
+        if not self._regime_history:
+            return {
+                'total_detections': 0,
+                'current_regime': 'UNKNOWN',
+                'regime_distribution': {}
+            }
 
+        # Count regime occurrences
+        regime_counts = {}
+        for regime in self._regime_history:
+            regime_counts[regime] = regime_counts.get(regime, 0) + 1
 
-# ============================================================================
-# LIGHTGBM REGIME DETECTOR
-# ============================================================================
-class LightGBMRegimeDetector:
-    """LightGBM model for hybrid regime prediction."""
-    
-    def __init__(self, models_path: str):
-        self.models_path = models_path
-        self.models = {}
-        self.is_trained = False
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self._load_models()
-    
-    def _load_models(self):
-        """Load pre-trained LightGBM models."""
-        if os.path.exists(self.models_path):
-            try:
-                with open(self.models_path, 'rb') as f:
-                    self.models = pickle.load(f)
-                self.is_trained = True
-                self.logger.info(f"[LIGHTGBM] Loaded models from {self.models_path}")
-            except Exception as e:
-                self.logger.error(f"[LIGHTGBM] Failed to load models: {e}")
-                self.is_trained = False
-        else:
-            self.logger.warning(f"[LIGHTGBM] Models not found at {self.models_path}")
-            self.is_trained = False
-    
-    def predict(self, df_m5: pd.DataFrame, df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> Dict:
-        """Predict using LightGBM ensemble."""
-        if not self.is_trained:
-            return {'prediction': None, 'confidence': 0.0}
+        # Calculate percentages
+        total = len(self._regime_history)
+        regime_pcts = {
+            r: round(c / total * 100, 1) for r, c in regime_counts.items()
+        }
+
+        return {
+            'total_detections': total,
+            'current_regime': self._last_regime,
+            'regime_distribution': regime_counts,
+            'regime_percentages': regime_pcts,
+            'unique_regimes': len(regime_counts)
+        }
+
+    def format_regime_log(self, context: Dict) -> str:
+        """
+        Format a concise log string for regime context.
         
-        return {'prediction': 'NEUTRAL', 'confidence': 0.5}
+        Args:
+            context: Regime context dict
+            
+        Returns:
+            Formatted log string
+        """
+        regime = context.get('regime_name', 'UNKNOWN')
+        category = context.get('regime_category', 'UNKNOWN')
+        conf = context.get('confidence', 0)
+        choppy = context.get('choppy_score', 0)
+        killers = context.get('active_killers', [])
+        kelly = context.get('kelly_multiplier', 1.0)
+        session = context.get('session', 'OTHER')
 
+        killer_str = f", Killers: {len(killers)}" if killers else ""
 
-# ============================================================================
-# RULE-BASED CLASSIFIER
-# ============================================================================
-class RuleBasedClassifier:
-    """Rule-based regime classifier using ADX, EMA, and volume."""
-    
-    def __init__(self):
-        self.logger = logging.getLogger(self.__class__.__name__)
-    
-    def extract_features(self, df_m5: pd.DataFrame, df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> Dict:
-        """Extract features for rule-based classification."""
-        features = {}
-        
-        try:
-            if df_m5 is not None and len(df_m5) >= 20:
-                close = df_m5['close'].values
-                features['m5_ema_20_slope'] = (close[-1] - close[-20]) / close[-20]
-                features['m5_adx'] = self._calculate_adx(df_m5)
-            
-            if df_m15 is not None and len(df_m15) >= 20:
-                close = df_m15['close'].values
-                features['m15_ema_20_slope'] = (close[-1] - close[-20]) / close[-20]
-                features['m15_adx'] = self._calculate_adx(df_m15)
-            
-            if df_h1 is not None and len(df_h1) >= 20:
-                close = df_h1['close'].values
-                features['h1_ema_20_slope'] = (close[-1] - close[-20]) / close[-20]
-            
-        except Exception as e:
-            self.logger.error(f"[RULES] Feature extraction error: {e}")
-        
-        return features
-    
-    def _calculate_adx(self, df: pd.DataFrame, period: int = 14) -> float:
-        """Calculate ADX indicator proxy."""
-        try:
-            high = df['high'].values
-            low = df['low'].values
-            close = df['close'].values
-            
-            tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
-            atr = pd.Series(tr).rolling(window=period, min_periods=period).mean().values
-            
-            return float(np.mean(tr[-period:]) / (atr[-1] + 1e-10) * 100)
-            
-        except Exception:
-            return 0.0
-    
-    def classify_regime(self, features: Dict) -> Tuple[int, str, float]:
-        """Classify regime based on rules."""
-        adx = features.get('m15_adx', 0)
-        slope = features.get('m15_ema_20_slope', 0)
-        
-        if adx > 25 and slope > 0.005:
-            return 0, 'BULL_TREND', 0.7
-        elif adx > 25 and slope < -0.005:
-            return 1, 'BEAR_TREND', 0.7
-        else:
-            return 2, 'SIDEWAY', 0.6
-
-
-# ============================================================================
-# COMPATIBILITY ALIAS
-# ============================================================================
-# Allows event_loop.py to import EnhancedRegimeRouter seamlessly
-EnhancedRegimeRouter = RegimeRouter
+        return (
+            f"[REGIME] {regime} ({category}) | "
+            f"Conf: {conf:.0%} | "
+            f"Choppy: {choppy:.0f} | "
+            f"Kelly: {kelly:.2f}x | "
+            f"Session: {session}{killer_str}"
+        )

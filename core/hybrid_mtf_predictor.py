@@ -1,124 +1,235 @@
 """
-Hybrid Multi-Timeframe Predictor.
-Combines HMM regime detection with LightGBM classifiers for directional prediction.
+Hybrid Multi-Timeframe Predictor - LightGBM Based.
+
+Uses LightGBM models trained on MTF features to predict market regime.
+
+Features:
+  - Multi-timeframe feature extraction
+  - LightGBM ensemble prediction
+  - Regime confidence scoring
+  - Fallback to rule-based classification
+
+Used by:
+  - RegimeRouter (ensemble with HMM and Rule-based)
 """
 import pandas as pd
 import numpy as np
 import logging
 import joblib
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
+from config import config
+from core.mtf_feature_engineer import MTFFeatureEngineer
 
 
 class HybridMTFPredictor:
-    LABELS = ['DOWN', 'SIDEWAY', 'UP']
+    """
+    LightGBM-based multi-timeframe regime predictor.
     
-    def __init__(self, hmm_detector, model_path: str = "lightgbm_regime_models.pkl"):
+    Features:
+      - Multi-timeframe feature extraction
+      - LightGBM ensemble (one model per regime)
+      - Confidence scoring
+      - Graceful degradation to rule-based
+    """
+
+    def __init__(self, models_path: str = None):
+        """
+        Initialize HybridMTFPredictor.
+        
+        Args:
+            models_path: Path to LightGBM models (defaults to config.lightgbm_models_path)
+        """
+        if models_path is None:
+            models_path = config.lightgbm_models_path
+            
+        self.models_path = models_path
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.hmm_detector = hmm_detector
-        self.model_path = model_path
-        self.lightgbm_models = {}
-        self.feature_names = None
+
+        # Feature engineer
+        self.feature_engineer = MTFFeatureEngineer()
+
+        # Models storage
+        self.models = {}
+        self.is_loaded = False
+
+        # Regime mapping
+        self.regime_names = {
+            0: 'HEALTHY_UPTREND',
+            1: 'HEALTHY_DOWNTREND',
+            2: 'QUIET_RALLY',
+            3: 'SLOW_BLEED',
+            4: 'CLASSIC_RANGE',
+            5: 'TIGHT_RANGE',
+            6: 'PRE_BREAKOUT',
+            7: 'CONSOLIDATING_BULL',
+            8: 'CONSOLIDATING_BEAR',
+            9: 'PARABOLIC_RALLY',
+            10: 'PANIC_CAPITULATION',
+            11: 'VOLATILE_CHOP',
+            12: 'WHIPSAW_MARKET',
+            13: 'OVERSOLD_BOUNCE',
+            14: 'EXHAUSTED_BULL',
+            15: 'EXHAUSTED_BEAR',
+            16: 'ANOMALY_BULL',
+            17: 'ANOMALY_BEAR'
+        }
+
         self._try_load_models()
-    
+
     def _try_load_models(self):
         """Attempt to load pre-trained LightGBM models."""
         try:
-            data = joblib.load(self.model_path)
+            import lightgbm as lgb
+
+            data = joblib.load(self.models_path)
+
             if isinstance(data, dict):
-                self.lightgbm_models = data.get('models', data)
-                self.feature_names = data.get('feature_names')
-                self.logger.info(f"[OK] Loaded {len(self.lightgbm_models)} LightGBM models")
+                self.models = data.get('models', {})
+                self.is_loaded = len(self.models) > 0
+                if self.is_loaded:
+                    self.logger.info(
+                        f"[LGBM] Loaded {len(self.models)} LightGBM models from {self.models_path}"
+                    )
             else:
-                self.logger.warning("[WARN] Invalid LightGBM model format")
+                self.logger.warning(f"[LGBM] Model file exists but is invalid")
+
         except FileNotFoundError:
-            self.logger.info(f"[INFO] No LightGBM models found at {self.model_path}")
+            self.logger.info(f"[LGBM] No pre-trained LightGBM models found at {self.models_path}")
+        except ImportError:
+            self.logger.warning("[LGBM] lightgbm not installed, predictor disabled")
         except Exception as e:
-            self.logger.warning(f"[WARN] Failed to load LightGBM models: {e}")
-    
-    def predict(self, df_m5: pd.DataFrame, df_m15: pd.DataFrame = None, df_h1: pd.DataFrame = None) -> Dict:
+            self.logger.warning(f"[LGBM] Failed to load models: {e}")
+
+    def predict(
+        self,
+        df_m15: pd.DataFrame,
+        df_m5: pd.DataFrame = None,
+        df_h1: pd.DataFrame = None
+    ) -> Dict:
         """
-        Predict direction using hybrid HMM + LightGBM ensemble.
-        [FIX] Uses .predict() instead of .predict_proba() for native LightGBM Booster.
-        """
-        # Get HMM regime
-        regime_id, regime_conf, regime_details = (2, 0.5, {})
-        if self.hmm_detector is not None and self.hmm_detector.is_trained:
-            regime_id, regime_conf, regime_details = self.hmm_detector.predict(df_m15 if df_m15 is not None else df_m5)
+        Predict current regime using LightGBM ensemble.
         
-        # Get LightGBM prediction
-        lgbm_pred, lgbm_probs = None, None
-        if regime_id in self.lightgbm_models:
-            try:
-                from core.mtf_feature_engineer import MTFFeatureEngineer
-                engineer = MTFFeatureEngineer()
-                features = engineer.extract_all_features(df_m5, df_m15, df_h1)
-                
-                if not features.empty:
-                    latest = features.iloc[[-1]].copy()
-                    
-                    # Align columns with training features
-                    if self.feature_names:
-                        for c in set(self.feature_names) - set(latest.columns):
-                            latest[c] = 0
-                        latest = latest[[c for c in self.feature_names if c in latest.columns]]
-                    
-                    # [FIX] Native LightGBM Booster uses .predict() which returns probabilities directly for multiclass
-                    # The output shape is (n_samples, n_classes), so we take [0] to get the first (and only) row
-                    probs = self.lightgbm_models[regime_id].predict(latest)[0]
-                    
-                    lgbm_pred = self.LABELS[np.argmax(probs)]
-                    lgbm_probs = {
-                        'DOWN': float(probs[0]),
-                        'SIDEWAY': float(probs[1]),
-                        'UP': float(probs[2])
-                    }
-            except Exception as e:
-                self.logger.error(f"[FAIL] LightGBM prediction error: {e}", exc_info=True)
-        
-        # Meta-ensemble
-        result = self._meta_ensemble(regime_id, regime_conf, lgbm_pred, lgbm_probs)
-        result['regime_id'] = regime_id
-        result['regime_name'] = regime_details.get('regime_name', 'UNKNOWN')
-        
-        return result
-    
-    def _meta_ensemble(self, hmm_id: int, hmm_conf: float,
-                       lgbm_pred: Optional[str], lgbm_probs: Optional[dict]) -> Dict:
-        """
-        Combine HMM and LightGBM predictions with confidence thresholds.
-        [FIX] Applies minimum confidence threshold and uses predicted class probability.
-        """
-        MIN_CONFIDENCE = 0.4  # Minimum confidence to trust a prediction
-        
-        if lgbm_pred is None or lgbm_probs is None:
-            # Fallback to HMM only
-            if hmm_conf < MIN_CONFIDENCE:
-                return {'prediction': 'SIDEWAY', 'confidence': 0.5, 'reason': 'low_hmm_confidence'}
+        Args:
+            df_m15: M15 DataFrame
+            df_m5: M5 DataFrame (optional)
+            df_h1: H1 DataFrame (optional)
             
-            if hmm_id == 0:
-                return {'prediction': 'UP', 'confidence': hmm_conf}
-            elif hmm_id == 1:
-                return {'prediction': 'DOWN', 'confidence': hmm_conf}
-            else:
-                return {'prediction': 'SIDEWAY', 'confidence': hmm_conf}
+        Returns:
+            Dict with regime, confidence, and method
+        """
+        if not self.is_loaded:
+            return self._fallback_prediction('models_not_loaded')
+
+        # Extract features
+        features_df = self.feature_engineer.extract_all_features(df_m15, df_m5, df_h1)
+
+        if features_df.empty:
+            return self._fallback_prediction('feature_extraction_failed')
+
+        # Get latest features
+        try:
+            latest_features = features_df.iloc[[-1]].drop(columns=['time'], errors='ignore')
+        except Exception as e:
+            self.logger.error(f"[LGBM] Feature selection error: {e}")
+            return self._fallback_prediction('feature_selection_failed')
+
+        # Predict with each model
+        predictions = {}
+        confidences = {}
+
+        try:
+            import lightgbm as lgb
+
+            for regime_id, model in self.models.items():
+                try:
+                    # Predict probability
+                    proba = model.predict_proba(latest_features)[0]
+
+                    # For binary classifier, probability is [not_regime, is_regime]
+                    if len(proba) == 2:
+                        predictions[regime_id] = proba[1]
+                    else:
+                        predictions[regime_id] = proba[0]
+
+                except Exception as e:
+                    self.logger.debug(f"[LGBM] Prediction error for regime {regime_id}: {e}")
+                    continue
+
+        except Exception as e:
+            self.logger.error(f"[LGBM] Prediction error: {e}")
+            return self._fallback_prediction('prediction_failed')
+
+        if not predictions:
+            return self._fallback_prediction('no_valid_predictions')
+
+        # Get regime with highest probability
+        best_regime_id = max(predictions.keys(), key=lambda k: predictions[k])
+        best_confidence = predictions[best_regime_id]
+
+        # Normalize confidence to 0-1
+        confidence = min(1.0, max(0.0, best_confidence))
+
+        regime_name = self.regime_names.get(best_regime_id, 'UNKNOWN')
+
+        return {
+            'regime': regime_name,
+            'regime_id': best_regime_id,
+            'confidence': confidence,
+            'method': 'LIGHTGBM',
+            'all_predictions': {
+                self.regime_names.get(k, 'UNKNOWN'): round(v, 3)
+                for k, v in predictions.items()
+            }
+        }
+
+    def _fallback_prediction(self, reason: str) -> Dict:
+        """
+        Fallback to rule-based prediction when LightGBM fails.
         
-        # Map HMM to direction
-        hmm_direction = {0: 'UP', 1: 'DOWN', 2: 'SIDEWAY'}.get(hmm_id, 'SIDEWAY')
+        Args:
+            reason: Reason for fallback
+            
+        Returns:
+            Dict with regime info
+        """
+        try:
+            from core.regime_classifier import RegimeClassifier
+            classifier = RegimeClassifier()
+            result = classifier.classify(df_m5=None)
+
+            return {
+                'regime': result.get('regime_name', 'UNKNOWN'),
+                'confidence': 0.5,
+                'method': 'RULE_BASED_FALLBACK',
+                'reason': reason
+            }
+        except Exception as e:
+            self.logger.error(f"[LGBM] Fallback failed: {e}")
+            return {
+                'regime': 'UNKNOWN',
+                'confidence': 0.0,
+                'method': 'NONE',
+                'reason': f'All methods failed: {reason}'
+            }
+
+    def get_model_info(self) -> Dict:
+        """
+        Get information about loaded models.
         
-        # [FIX] Get probability of the predicted class, not max probability
-        lgbm_conf = lgbm_probs.get(lgbm_pred, 0.0)
-        
-        # Agreement check
-        if lgbm_pred == hmm_direction:
-            # Both agree - boost confidence
-            combined_conf = min(0.95, (hmm_conf + lgbm_conf) / 2 + 0.1)
-            return {'prediction': lgbm_pred, 'confidence': combined_conf}
-        else:
-            # Disagreement - trust higher confidence
-            if lgbm_conf > hmm_conf and lgbm_conf >= MIN_CONFIDENCE:
-                return {'prediction': lgbm_pred, 'confidence': lgbm_conf * 0.8}
-            elif hmm_conf >= MIN_CONFIDENCE:
-                return {'prediction': hmm_direction, 'confidence': hmm_conf * 0.8}
-            else:
-                # Both have low confidence - default to SIDEWAY
-                return {'prediction': 'SIDEWAY', 'confidence': 0.5, 'reason': 'both_low_confidence'}
+        Returns:
+            Dict with model information
+        """
+        if not self.is_loaded:
+            return {
+                'loaded': False,
+                'model_count': 0,
+                'regimes': []
+            }
+
+        return {
+            'loaded': True,
+            'model_count': len(self.models),
+            'regimes': [self.regime_names.get(k, 'UNKNOWN') for k in self.models.keys()],
+            'models_path': self.models_path
+        }
